@@ -16,7 +16,7 @@ WHISPER_CHANNELS = 1
 class WhisperLocalTranscriber(core.STTPlugin):
 
     def __init__(self):
-        super().__init__(process=self.process)
+        super().__init__(process=self.process, close=self._close)
         self._model = None
 
     def process(
@@ -63,3 +63,6 @@ class WhisperLocalTranscriber(core.STTPlugin):
                 result += segment["text"]
 
         return result
+
+    def _close(self):
+        pass

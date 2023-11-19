@@ -20,39 +20,34 @@ async def stt_agent(ctx: agents.JobContext):
         if publication.kind != rtc.TrackKind.KIND_AUDIO:
             return
 
-        asyncio.create_task(process_track(track))
+        asyncio.create_task(process_track(ctx.room, track, participant))
 
 
-async def process_track(track: rtc.Track):
+async def process_track(room: rtc.Room, track: rtc.Track, participant: rtc.RemoteParticipant):
     audio_stream = rtc.AudioStream(track)
     input_iterator = core.PluginIterator.create(audio_stream)
     vad_plugin = VADPlugin(
         left_padding_ms=250, silence_threshold_ms=500)
     stt_plugin = WhisperLocalTranscriber()
 
-    vad_results = vad_plugin \
+    await vad_plugin \
         .set_input(input_iterator) \
         .filter(lambda data: data.type == core.VADPluginResultType.FINISHED) \
         .pipe(stt_plugin) \
-        .map(lambda data: data.frames) \
-        .unwrap()
-    stt_results = stt_plugin.start(vad_results)
-
-    async for event in stt_results:
-        if event.type == core.STTPluginEventType.ERROR:
-            continue
-
-        text = event.data.text
-        asyncio.create_task(ctx.room.local_participant.publish_data(text))
+        .map_async(lambda text_stream, metadata: process_stt(room, participant, text_stream, metadata)) \
+        .run()
 
 
-async def process_stt(text_stream: AsyncIterator[str], metadata: core.PluginIterator.ResultMetadata):
-    complete_stt_result = ""
+async def process_stt(room: rtc.Room,
+                      participant: rtc.RemoteParticipant,
+                      text_stream: AsyncIterator[str],
+                      metadata: core.PluginIterator.ResultMetadata,
+                      ):
+    complete_text = ""
     async for stt_r in text_stream:
-        complete_stt_result += stt_r.text
-    msg = ChatGPTMessage(
-        role=ChatGPTMessageRole.user, content=complete_stt_result)
-    return msg
+        complete_text += stt_r.text
+    logging.info(f"{participant.identity}: {complete_text}")
+    asyncio.create_task(room.local_participant.publish_data(complete_text))
 
 
 if __name__ == "__main__":
