@@ -160,13 +160,14 @@ class KITT:
         # send audio to TTS in parallel
         self.ctx.create_task(self.send_audio_stream(stream))
         all_text = ""
+        chat_message = await self.chat.send_message(all_text)
         async for text in text_stream:
             stream.push_text(text)
             all_text += text
+            chat_message.message = all_text
+            await self.chat.update_message(chat_message)
 
         self.update_state(processing=False)
-        # buffer up the entire response from ChatGPT before sending a chat message
-        await self.chat.send_message(all_text)
         await stream.flush()
 
     async def send_audio_stream(self, tts_stream: AsyncIterable[SynthesisEvent]):
