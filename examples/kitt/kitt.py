@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
+import threading
 import asyncio
 from datetime import datetime
 from enum import Enum
@@ -28,6 +31,7 @@ from chatgpt import (
 )
 from deepgram import STTStream
 from livekit.plugins.elevenlabs import TTS
+
 
 PROMPT = "You are KITT, a friendly voice assistant powered by LiveKit.  \
           Conversation should be personable, and be sure to ask follow up questions. \
@@ -54,6 +58,28 @@ AgentState = Enum("AgentState", "IDLE, LISTENING, THINKING, SPEAKING")
 ELEVEN_TTS_SAMPLE_RATE = 24000
 ELEVEN_TTS_CHANNELS = 1
 
+
+class WorkerLifecycle:
+    def __init__(self):
+        self._accepting_jobs = True 
+        self._stop_thread = threading.Thread(target=self._stop_accepting_jobs_after, args=(1800,))
+        self._stop_thread.start()
+
+    def _stop_accepting_jobs_after(self, after: int):
+        time.sleep(after)
+        self._accepting_jobs = False
+        self._kill_after(60 * 10) # kill 10 minutes after stopping accepting jobs
+
+    def _kill_after(self, after: int):
+        time.sleep(after)
+        self._kill()
+
+    def should_accept_job(self):
+        return self._accepting_jobs
+
+    def _kill(self):
+        # kill the worker
+        os._exit(0)
 
 class KITT:
     @classmethod
@@ -201,8 +227,13 @@ class KITT:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
+    worker_lifecycle = WorkerLifecycle()
+
     async def job_request_cb(job_request: agents.JobRequest):
         logging.info("Accepting job for KITT")
+        if not worker_lifecycle.should_accept_job():
+            await job_request.reject()
+            return
 
         await job_request.accept(
             KITT.create,
