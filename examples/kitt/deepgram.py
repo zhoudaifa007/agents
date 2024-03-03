@@ -10,6 +10,21 @@ from typing import Optional
 import aiohttp
 from livekit import rtc
 
+from enum import Enum
+
+
+# taken from deepgram-sdk
+class LiveTranscriptionEvents(str, Enum):
+    Open: str = "Open"
+    Close: str = "Close"
+    Transcript: str = "Results"
+    Metadata: str = "Metadata"
+    UtteranceEnd: str = "UtteranceEnd"
+    SpeechStarted: str = "SpeechStarted"
+    Error: str = "Error"
+    Warning: str = "Warning"
+
+
 STREAM_KEEPALIVE_MSG: str = json.dumps({"type": "KeepAlive"})
 STREAM_CLOSE_MSG: str = json.dumps({"type": "CloseStream"})
 
@@ -114,6 +129,7 @@ class STTStream:
     async def _listen_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         speaking = False
         last_transcript = ""
+
         while not ws.closed:
             msg = await ws.receive()
             if msg.type in (
@@ -127,35 +143,41 @@ class STTStream:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
                     type = data.get("type")
-                    print(type)
                     if not type:
                         continue
 
                     if not speaking:
-                        if type == "SpeechStarted":
+                        if type == LiveTranscriptionEvents.SpeechStarted:
                             speaking = True
                             event = self.StartedEvent()
                             await self._event_queue.put(event)
-                            continue
                     else:
-                        if type == "UtteranceEnd":
-                            speaking = False
-                            event = self.FinishedEvent(text=last_transcript)
-                            last_transcript = ""
-                            await self._event_queue.put(event)
-                            continue
-                        elif type == "Results":
-                            speech_final = data["speech_final"]
-                            last_transcript = data["channel"]["alternatives"][0][
-                                "transcript"
-                            ]
-                            print(data)
-                            if speech_final:
+                        if type == LiveTranscriptionEvents.UtteranceEnd:
+                            if last_transcript != "":
+                                print(f"\n\n !!!! UTTERANCE: {last_transcript}\n\n")
                                 speaking = False
                                 event = self.FinishedEvent(text=last_transcript)
                                 last_transcript = ""
                                 await self._event_queue.put(event)
-                            continue
+                        elif type == LiveTranscriptionEvents.Transcript:
+                            is_final_transcript = data["is_final"]
+                            is_endpoint = data["speech_final"]
+
+                            if is_final_transcript:
+                                transcript = data["channel"]["alternatives"][0][
+                                    "transcript"
+                                ]
+                                if transcript != "":
+                                    last_transcript += transcript
+                                    if not is_endpoint:
+                                        last_transcript += " "
+
+                            if is_endpoint and last_transcript != "":
+                                print(f"\n\n !!!! ENDPOINT: {last_transcript}\n\n")
+                                speaking = False
+                                event = self.FinishedEvent(text=last_transcript)
+                                last_transcript = ""
+                                await self._event_queue.put(event)
 
             except Exception as e:
                 logging.error("Error handling message %s: %s", msg, e)
