@@ -66,7 +66,7 @@ class WorkerLifecycle:
         # Stop accepting jobs after a random time between 20 and 30 minutes
         self._stop_thread = threading.Thread(
             target=self._stop_accepting_jobs_after,
-            args=(random.randrange(60 * 20, 60 * 30),),
+            args=(random.randrange(60 * 60, 60 * 120),),
         )
         self._stop_thread.start()
 
