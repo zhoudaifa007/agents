@@ -62,15 +62,20 @@ ELEVEN_TTS_CHANNELS = 1
 
 class WorkerLifecycle:
     def __init__(self):
-        self._accepting_jobs = True 
+        self._accepting_jobs = True
         # Stop accepting jobs after a random time between 20 and 30 minutes
-        self._stop_thread = threading.Thread(target=self._stop_accepting_jobs_after, args=(random.randrange(60 * 20, 60 * 30),))
+        self._stop_thread = threading.Thread(
+            target=self._stop_accepting_jobs_after,
+            args=(random.randrange(60 * 20, 60 * 30),),
+        )
         self._stop_thread.start()
 
     def _stop_accepting_jobs_after(self, after: int):
         time.sleep(after)
         self._accepting_jobs = False
-        self._kill_after(random.randrange(10 * 60, 15 * 60)) # kill 10-15 minutes after stopping accepting jobs
+        self._kill_after(
+            random.randrange(2 * 60, 4 * 60)
+        )  # kill 10-15 minutes after stopping accepting jobs
 
     def _kill_after(self, after: int):
         time.sleep(after)
@@ -82,6 +87,7 @@ class WorkerLifecycle:
     def _kill(self):
         # kill the worker
         os._exit(0)
+
 
 class KITT:
     @classmethod
@@ -173,7 +179,9 @@ class KITT:
                     topic="transcription",
                 )
 
-                msg = ChatGPTMessage(role=ChatGPTMessageRole.user, content=buffered_text)
+                msg = ChatGPTMessage(
+                    role=ChatGPTMessageRole.user, content=buffered_text
+                )
                 chatgpt_stream = self.chatgpt_plugin.add_message(msg)
                 self.ctx.create_task(self.process_chatgpt_result(chatgpt_stream))
                 buffered_text = ""
