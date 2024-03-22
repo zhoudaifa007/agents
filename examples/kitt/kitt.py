@@ -25,13 +25,14 @@ from typing import AsyncIterable
 
 from livekit import rtc, agents
 from livekit.agents.tts import SynthesisEvent, SynthesisEventType
-from chatgpt import (
-    ChatGPTMessage,
-    ChatGPTMessageRole,
-    ChatGPTPlugin,
-)
+
+from groq_plugin import GroqMessage, GroqMessageRole, GroqPlugin, GroqModels
 from deepgram import STTStream
 from livekit.plugins.elevenlabs import TTS
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 PROMPT = "You are KITT, a friendly voice assistant powered by LiveKit.  \
@@ -97,8 +98,8 @@ class KITT:
 
     def __init__(self, ctx: agents.JobContext):
         # plugins
-        self.chatgpt_plugin = ChatGPTPlugin(
-            prompt=PROMPT, message_capacity=20, model="gpt-4-1106-preview"
+        self.groq_plugin = GroqPlugin(
+            prompt=PROMPT, message_capacity=20, model=GroqModels.Mixtral7B.value
         )
         self.tts_plugin = TTS(
             model_id="eleven_turbo_v2", sample_rate=ELEVEN_TTS_SAMPLE_RATE
@@ -128,7 +129,7 @@ class KITT:
         await asyncio.sleep(1)
 
         sip = self.ctx.room.name.startswith("sip")
-        await self.process_chatgpt_result(intro_text_stream(sip))
+        await self.process_groq_result(intro_text_stream(sip))
         self.update_state()
 
     def on_chat_received(self, message: rtc.ChatMessage):
@@ -136,9 +137,9 @@ class KITT:
         if message.deleted:
             return
 
-        msg = ChatGPTMessage(role=ChatGPTMessageRole.user, content=message.message)
-        chatgpt_result = self.chatgpt_plugin.add_message(msg)
-        self.ctx.create_task(self.process_chatgpt_result(chatgpt_result))
+        msg = GroqMessage(role=GroqMessageRole.user, content=message.message)
+        groq_result = self.groq_plugin.add_message(msg)
+        self.ctx.create_task(self.process_chatgpt_result(groq_result))
 
     def on_track_subscribed(
         self,
@@ -179,15 +180,13 @@ class KITT:
                     topic="transcription",
                 )
 
-                msg = ChatGPTMessage(
-                    role=ChatGPTMessageRole.user, content=buffered_text
-                )
-                chatgpt_stream = self.chatgpt_plugin.add_message(msg)
-                self.ctx.create_task(self.process_chatgpt_result(chatgpt_stream))
+                msg = GroqMessage(role=GroqMessageRole.user, content=buffered_text)
+                groq_stream = self.groq_plugin.add_message(msg)
+                self.ctx.create_task(self.process_groq_result(groq_stream))
                 buffered_text = ""
 
-    async def process_chatgpt_result(self, text_stream):
-        # ChatGPT is streamed, so we'll flip the state immediately
+    async def process_groq_result(self, text_stream):
+        # Groq is streamed, so we'll flip the state immediately
         self.update_state(processing=True)
 
         stream = self.tts_plugin.stream()
@@ -199,7 +198,7 @@ class KITT:
             all_text += text
 
         self.update_state(processing=False)
-        # buffer up the entire response from ChatGPT before sending a chat message
+        # buffer up the entire response from Groq before sending a chat message
         await self.chat.send_message(all_text)
         await stream.flush()
 

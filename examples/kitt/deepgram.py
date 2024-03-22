@@ -154,7 +154,6 @@ class STTStream:
                     else:
                         if type == LiveTranscriptionEvents.UtteranceEnd:
                             if last_transcript != "":
-                                print(f"\n\n !!!! UTTERANCE: {last_transcript}\n\n")
                                 speaking = False
                                 event = self.FinishedEvent(text=last_transcript)
                                 last_transcript = ""
@@ -173,7 +172,6 @@ class STTStream:
                                         last_transcript += " "
 
                             if is_endpoint and last_transcript != "":
-                                print(f"\n\n !!!! ENDPOINT: {last_transcript}\n\n")
                                 speaking = False
                                 event = self.FinishedEvent(text=last_transcript)
                                 last_transcript = ""
