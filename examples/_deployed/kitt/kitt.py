@@ -30,6 +30,14 @@ async def entrypoint(ctx: JobContext):
     prompt = RUNDOWN_PROMPT if rundown else MAIN_PROMPT
     greeting = RUNDOWN_GREETING if rundown else MAIN_GREETING
     initial_ctx = ChatContext(messages=[ChatMessage(role=ChatRole.SYSTEM, text=prompt)])
+    tts = (
+        elevenlabs.TTS(
+            encoding="pcm_44100",
+            voice=Voice(id="sR1Nne6UFqWWc3gpP4Ja", name="Russ", category="standard"),
+        )
+        if rundown
+        else elevenlabs.TTS(encoding="pcm_44100")
+    )
 
     gpt = openai.LLM(
         model="gpt-4o",
@@ -38,10 +46,7 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD(),
         stt=deepgram.STT(),
         llm=gpt,
-        tts=elevenlabs.TTS(
-            encoding="pcm_44100",
-            voice=Voice(id="sR1Nne6UFqWWc3gpP4Ja", name="Russ", category="standard"),
-        ),
+        tts=tts,
         chat_ctx=initial_ctx,
     )
 
