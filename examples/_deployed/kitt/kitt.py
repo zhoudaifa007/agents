@@ -21,11 +21,14 @@ LiveKit rec""ently raised a $22.5M round of funding to build infrastructure for 
 Users wil""l call in and speak with you using a telephone. You will converse with them using your voice
 In gen""eral, you should use short and concise responses and avoid using unpronounceable punctuation.
 You should also act professionally, but it's OK to speak casually or informally, and occasionally tell a self-deprecating joke or two."""
+MAIN_GREETING = "Hey, how can I help you today?"
+RUNDOWN_GREETING = "Hey hey, this is LiveKit's founder and C3PO, what's on your mind?"
 
 
 async def entrypoint(ctx: JobContext):
     rundown = ctx.room.name.startswith("rundown")
     prompt = RUNDOWN_PROMPT if rundown else MAIN_PROMPT
+    greeting = RUNDOWN_GREETING if rundown else MAIN_GREETING
     initial_ctx = ChatContext(messages=[ChatMessage(role=ChatRole.SYSTEM, text=prompt)])
 
     gpt = openai.LLM(
@@ -61,7 +64,7 @@ async def entrypoint(ctx: JobContext):
     assistant.start(ctx.room)
 
     await asyncio.sleep(0.5)
-    await assistant.say("Hey, how can I help you today?", allow_interruptions=True)
+    await assistant.say(greeting, allow_interruptions=True)
 
 
 async def request_fnc(req: JobRequest) -> None:
