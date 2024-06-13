@@ -11,80 +11,34 @@ from livekit.agents.llm import (
     ChatMessage,
     ChatRole,
 )
-from livekit.agents.voice_assistant import AssistantContext, VoiceAssistant
+from livekit.agents.voice_assistant import VoiceAssistant
 from livekit.plugins import deepgram, elevenlabs, openai, silero
+from livekit.plugins.elevenlabs import Voice
 
-MAX_IMAGES = 3
-NO_IMAGE_MESSAGE_GENERIC = (
-    "I'm sorry, I don't have an image to process. Are you publishing your video?"
-)
-
-
-class AssistantFnc(agents.llm.FunctionContext):
-    @agents.llm.ai_callable(
-        desc="Called when asked to evaluate something that would require vision capabilities."
-    )
-    async def image(
-        self,
-        user_msg: Annotated[
-            str,
-            agents.llm.TypeInfo(desc="The user message that triggered this function"),
-        ],
-    ):
-        ctx = AssistantContext.get_current()
-        ctx.store_metadata("user_msg", user_msg)
-
-
-async def get_human_video_track(room: rtc.Room):
-    track_future = asyncio.Future[rtc.RemoteVideoTrack]()
-
-    def on_sub(track: rtc.Track, *_):
-        if isinstance(track, rtc.RemoteVideoTrack):
-            track_future.set_result(track)
-
-    room.on("track_subscribed", on_sub)
-
-    remote_video_tracks: List[rtc.RemoteVideoTrack] = []
-    for _, p in room.participants.items():
-        for _, t_pub in p.tracks.items():
-            if t_pub.track is not None and isinstance(
-                t_pub.track, rtc.RemoteVideoTrack
-            ):
-                remote_video_tracks.append(t_pub.track)
-
-    if len(remote_video_tracks) > 0:
-        track_future.set_result(remote_video_tracks[0])
-
-    video_track = await track_future
-    room.off("track_subscribed", on_sub)
-    return video_track
+MAIN_PROMPT = "You are a funny bot created by LiveKit. Your interface with users will be voice. You should use short and concise responses, and avoiding usage of unpronouncable punctuation."
+RUNDOWN_PROMPT = """You are an assistant acting as the founder and CEO of the company, LiveKit. You will answer any questions users have when they call in to speak to you
+LiveKit rec""ently raised a $22.5M round of funding to build infrastructure for realtime voice and video-driven AI applications
+Users wil""l call in and speak with you using a telephone. You will converse with them using your voice
+In gen""eral, you should use short and concise responses and avoid using unpronounceable punctuation.
+You should also act professionally, but it's OK to speak casually or informally, and occasionally tell a self-deprecating joke or two."""
 
 
 async def entrypoint(ctx: JobContext):
-    sip = ctx.room.name.startswith("sip")
-    initial_ctx = ChatContext(
-        messages=[
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                text=(
-                    "You are a funny bot created by LiveKit. Your interface with users will be voice. "
-                    "You should use short and concise responses, and avoiding usage of unpronouncable punctuation."
-                ),
-            )
-        ]
-    )
+    rundown = ctx.room.name.startswith("rundown")
+    prompt = RUNDOWN_PROMPT if rundown else MAIN_PROMPT
+    initial_ctx = ChatContext(messages=[ChatMessage(role=ChatRole.SYSTEM, text=prompt)])
 
     gpt = openai.LLM(
         model="gpt-4o",
     )
-    latest_image: rtc.VideoFrame | None = None
-    img_msg_queue: deque[agents.llm.ChatMessage] = deque()
     assistant = VoiceAssistant(
         vad=silero.VAD(),
         stt=deepgram.STT(),
         llm=gpt,
-        tts=elevenlabs.TTS(encoding="pcm_44100"),
-        fnc_ctx=None if sip else AssistantFnc(),
+        tts=elevenlabs.TTS(
+            encoding="pcm_44100",
+            voice=Voice(id="sR1Nne6UFqWWc3gpP4Ja", name="Russ", category="standard"),
+        ),
         chat_ctx=initial_ctx,
     )
 
@@ -104,42 +58,10 @@ async def entrypoint(ctx: JobContext):
 
         asyncio.create_task(_answer_from_text(msg.message))
 
-    async def respond_to_image(user_msg: str):
-        nonlocal latest_image, img_msg_queue, initial_ctx
-        if not latest_image:
-            await assistant.say(NO_IMAGE_MESSAGE_GENERIC)
-            return
-
-        initial_ctx.messages.append(
-            agents.llm.ChatMessage(
-                role=agents.llm.ChatRole.USER,
-                text=user_msg,
-                images=[agents.llm.ChatImage(image=latest_image)],
-            )
-        )
-        img_msg_queue.append(initial_ctx.messages[-1])
-        if len(img_msg_queue) >= MAX_IMAGES:
-            msg = img_msg_queue.popleft()
-            msg.images = []
-
-        stream = await gpt.chat(initial_ctx)
-        await assistant.say(stream, allow_interruptions=True)
-
-    @assistant.on("function_calls_finished")
-    def _function_calls_done(ctx: AssistantContext):
-        user_msg = ctx.get_metadata("user_msg")
-        if not user_msg:
-            return
-        asyncio.ensure_future(respond_to_image(user_msg))
-
     assistant.start(ctx.room)
 
     await asyncio.sleep(0.5)
     await assistant.say("Hey, how can I help you today?", allow_interruptions=True)
-    while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
-        video_track = await get_human_video_track(ctx.room)
-        async for event in rtc.VideoStream(video_track):
-            latest_image = event.frame
 
 
 async def request_fnc(req: JobRequest) -> None:
