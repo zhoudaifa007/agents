@@ -1,22 +1,21 @@
 import asyncio
 import logging
+import random
 
+from dotenv import load_dotenv
 from livekit import rtc
-from livekit.agents import (
-    JobContext,
-    JobRequest,
-    WorkerOptions,
-    cli,
-)
+from livekit.agents import JobContext, WorkerOptions, cli
+
+# Load environment variables
+load_dotenv()
 
 WIDTH = 640
 HEIGHT = 480
 
-# change this color in dev mode and the agent will automatically update
-COLOR = bytes([0, 255, 0, 255])
-
 
 async def entrypoint(job: JobContext):
+    await job.connect()
+
     room = job.room
     source = rtc.VideoSource(WIDTH, HEIGHT)
     track = rtc.LocalVideoTrack.create_video_track("single-color", source)
@@ -29,16 +28,17 @@ async def entrypoint(job: JobContext):
         while True:
             await asyncio.sleep(0.1)  # 100ms
 
-            argb_frame[:] = COLOR * WIDTH * HEIGHT
+            # Create a new random color
+            r, g, b = [random.randint(0, 255) for _ in range(3)]
+            color = bytes([r, g, b, 255])
+
+            # Fill the frame with the new random color
+            argb_frame[:] = color * WIDTH * HEIGHT
             frame = rtc.VideoFrame(WIDTH, HEIGHT, rtc.VideoBufferType.RGBA, argb_frame)
             source.capture_frame(frame)
 
-    asyncio.create_task(_draw_color())
-
-
-async def request_fnc(req: JobRequest) -> None:
-    await req.accept(entrypoint)
+    await _draw_color()
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(request_fnc=request_fnc))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

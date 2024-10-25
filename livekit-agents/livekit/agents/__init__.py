@@ -13,9 +13,11 @@
 # limitations under the License.
 
 from . import (
-    aio,
+    cli,
     ipc,
     llm,
+    multimodal,
+    pipeline,
     stt,
     tokenize,
     transcription,
@@ -24,31 +26,49 @@ from . import (
     vad,
     voice_assistant,
 )
-from .apipe import AsyncPipe  # noqa
-from .ipc.protocol import IPC_MESSAGES, Log, StartJobRequest, StartJobResponse  # noqa
-from .job_context import JobContext
-from .job_request import AutoDisconnect, AutoSubscribe, JobRequest
+from ._constants import ATTRIBUTE_AGENT_STATE
+from ._exceptions import AssignmentTimeoutError
+from ._types import AgentState
+from .job import AutoSubscribe, JobContext, JobExecutorType, JobProcess, JobRequest
 from .plugin import Plugin
 from .version import __version__
-from .worker import Worker, WorkerOptions
+from .worker import Worker, WorkerOptions, WorkerPermissions, WorkerType
 
 __all__ = [
     "__version__",
     "Worker",
     "WorkerOptions",
-    "JobRequest",
-    "AutoSubscribe",
-    "AutoDisconnect",
+    "WorkerType",
+    "WorkerPermissions",
+    "JobProcess",
     "JobContext",
+    "JobRequest",
+    "JobExecutorType",
+    "AutoSubscribe",
+    "AgentState",
     "Plugin",
     "ipc",
     "stt",
     "vad",
     "utils",
     "tts",
-    "aio",
     "tokenize",
     "llm",
-    "voice_assistant",
     "transcription",
+    "pipeline",
+    "multimodal",
+    "voice_assistant",
+    "cli",
+    "AssignmentTimeoutError",
+    "ATTRIBUTE_AGENT_STATE",
+    "AgentState",
 ]
+
+# Cleanup docs of unexported modules
+_module = dir()
+NOT_IN_ALL = [m for m in _module if m not in __all__]
+
+__pdoc__ = {}
+
+for n in NOT_IN_ALL:
+    __pdoc__[n] = False

@@ -16,26 +16,34 @@
 from .sentence_tokenizer import SentenceTokenizer
 from .version import __version__
 
-__all__ = [
-    "SentenceTokenizer",
-    "__version__",
-]
+__all__ = ["SentenceTokenizer", "__version__"]
 
 
 from livekit.agents import Plugin
 
 import nltk  # type: ignore
 
+from .log import logger
+
 
 class NltkPlugin(Plugin):
     def __init__(self):
-        super().__init__(__name__, __version__, __package__)
+        super().__init__(__name__, __version__, __package__, logger)
 
     def download_files(self):
         try:
-            _ = nltk.data.find("tokenizers/punkt")
+            _ = nltk.data.find("tokenizers/punkt_tab")
         except LookupError:
-            nltk.download("punkt")
+            nltk.download("punkt_tab")
 
 
 Plugin.register_plugin(NltkPlugin())
+
+# Cleanup docs of unexported modules
+_module = dir()
+NOT_IN_ALL = [m for m in _module if m not in __all__]
+
+__pdoc__ = {}
+
+for n in NOT_IN_ALL:
+    __pdoc__[n] = False
