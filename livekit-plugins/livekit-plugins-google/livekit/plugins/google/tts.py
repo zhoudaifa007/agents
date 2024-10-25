@@ -14,27 +14,16 @@
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 from dataclasses import dataclass
-from typing import Optional, Union
 
 from livekit import rtc
-from livekit.agents import tts
-from livekit.agents.utils import codecs
+from livekit.agents import tts, utils
 
 from google.cloud import texttospeech
-from google.cloud.texttospeech_v1.types import (
-    SsmlVoiceGender,
-    SynthesizeSpeechResponse,
-)
+from google.cloud.texttospeech_v1.types import SsmlVoiceGender, SynthesizeSpeechResponse
 
 from .log import logger
 from .models import AudioEncoding, Gender, SpeechLanguages
-
-LgType = Union[SpeechLanguages, str]
-GenderType = Union[Gender, str]
-AudioEncodingType = Union[AudioEncoding, str]
 
 
 @dataclass
@@ -47,37 +36,53 @@ class TTS(tts.TTS):
     def __init__(
         self,
         *,
-        language: LgType = "en-US",
-        gender: GenderType = "neutral",
+        language: SpeechLanguages | str = "en-US",
+        gender: Gender | str = "neutral",
         voice_name: str = "",  # Not required
-        encoding: AudioEncodingType = "linear16",
+        encoding: AudioEncoding | str = "linear16",
         sample_rate: int = 24000,
+        pitch: int = 0,
+        effects_profile_id: str = "",
         speaking_rate: float = 1.0,
         credentials_info: dict | None = None,
         credentials_file: str | None = None,
     ) -> None:
         """
-        if no credentials is provided, it will use the credentials on the environment
-        GOOGLE_APPLICATION_CREDENTIALS (default behavior of Google TextToSpeechAsyncClient)
+        Create a new instance of Google TTS.
+
+        Credentials must be provided, either by using the ``credentials_info`` dict, or reading
+        from the file specified in ``credentials_file`` or the ``GOOGLE_APPLICATION_CREDENTIALS``
+        environmental variable.
+
+        Args:
+            language (SpeechLanguages | str, optional): Language code (e.g., "en-US"). Default is "en-US".
+            gender (Gender | str, optional): Voice gender ("male", "female", "neutral"). Default is "neutral".
+            voice_name (str, optional): Specific voice name. Default is an empty string.
+            encoding (AudioEncoding | str, optional): Audio encoding format (e.g., "linear16"). Default is "linear16".
+            sample_rate (int, optional): Audio sample rate in Hz. Default is 24000.
+            pitch (float, optional): Speaking pitch, ranging from -20.0 to 20.0 semitones relative to the original pitch. Default is 0.
+            effects_profile_id (str): Optional identifier for selecting audio effects profiles to apply to the synthesized speech.
+            speaking_rate (float, optional): Speed of speech. Default is 1.0.
+            credentials_info (dict, optional): Dictionary containing Google Cloud credentials. Default is None.
+            credentials_file (str, optional): Path to the Google Cloud credentials JSON file. Default is None.
         """
+
         super().__init__(
-            streaming_supported=False, sample_rate=sample_rate, num_channels=1
+            capabilities=tts.TTSCapabilities(
+                streaming=False,
+            ),
+            sample_rate=sample_rate,
+            num_channels=1,
         )
 
         self._client: texttospeech.TextToSpeechAsyncClient | None = None
         self._credentials_info = credentials_info
         self._credentials_file = credentials_file
 
-        ssml_gender = SsmlVoiceGender.NEUTRAL
-        if gender == "male":
-            ssml_gender = SsmlVoiceGender.MALE
-        elif gender == "female":
-            ssml_gender = SsmlVoiceGender.FEMALE
-
         voice = texttospeech.VoiceSelectionParams(
             name=voice_name,
             language_code=language,
-            ssml_gender=ssml_gender,
+            ssml_gender=_gender_from_str(gender),
         )
 
         if encoding == "linear16" or encoding == "wav":
@@ -92,9 +97,35 @@ class TTS(tts.TTS):
             audio_config=texttospeech.AudioConfig(
                 audio_encoding=_audio_encoding,
                 sample_rate_hertz=sample_rate,
+                pitch=pitch,
+                effects_profile_id=effects_profile_id,
                 speaking_rate=speaking_rate,
             ),
         )
+
+    def update_options(
+        self,
+        *,
+        language: SpeechLanguages | str = "en-US",
+        gender: Gender | str = "neutral",
+        voice_name: str = "",  # Not required
+        speaking_rate: float = 1.0,
+    ) -> None:
+        """
+        Update the TTS options.
+
+        Args:
+            language (SpeechLanguages | str, optional): Language code (e.g., "en-US"). Default is "en-US".
+            gender (Gender | str, optional): Voice gender ("male", "female", "neutral"). Default is "neutral".
+            voice_name (str, optional): Specific voice name. Default is an empty string.
+            speaking_rate (float, optional): Speed of speech. Default is 1.0.
+        """
+        self._opts.voice = texttospeech.VoiceSelectionParams(
+            name=voice_name,
+            language_code=language,
+            ssml_gender=_gender_from_str(gender),
+        )
+        self._opts.audio_config.speaking_rate = speaking_rate
 
     def _ensure_client(self) -> texttospeech.TextToSpeechAsyncClient:
         if not self._client:
@@ -117,10 +148,7 @@ class TTS(tts.TTS):
         assert self._client is not None
         return self._client
 
-    def synthesize(
-        self,
-        text: str,
-    ) -> "ChunkedStream":
+    def synthesize(self, text: str) -> "ChunkedStream":
         return ChunkedStream(text, self._opts, self._ensure_client())
 
 
@@ -128,60 +156,60 @@ class ChunkedStream(tts.ChunkedStream):
     def __init__(
         self, text: str, opts: _TTSOptions, client: texttospeech.TextToSpeechAsyncClient
     ) -> None:
-        self._text = text
-        self._opts = opts
-        self._client = client
-        self._main_task: asyncio.Task | None = None
-        self._queue = asyncio.Queue[Optional[tts.SynthesizedAudio]]()
+        super().__init__()
+        self._text, self._opts, self._client = text, opts, client
 
-    async def _run(self) -> None:
-        try:
-            response: SynthesizeSpeechResponse = await self._client.synthesize_speech(
-                input=texttospeech.SynthesisInput(text=self._text),
-                voice=self._opts.voice,
-                audio_config=self._opts.audio_config,
+    @utils.log_exceptions(logger=logger)
+    async def _main_task(self) -> None:
+        request_id = utils.shortuuid()
+        segment_id = utils.shortuuid()
+        response: SynthesizeSpeechResponse = await self._client.synthesize_speech(
+            input=texttospeech.SynthesisInput(text=self._text),
+            voice=self._opts.voice,
+            audio_config=self._opts.audio_config,
+        )
+
+        data = response.audio_content
+        if self._opts.audio_config.audio_encoding == "mp3":
+            decoder = utils.codecs.Mp3StreamDecoder()
+            bstream = utils.audio.AudioByteStream(
+                sample_rate=self._opts.audio_config.sample_rate_hertz, num_channels=1
             )
-
-            data = response.audio_content
-            if self._opts.audio_config.audio_encoding == "mp3":
-                decoder = codecs.Mp3StreamDecoder()
-                frames = decoder.decode_chunk(data)
-                for frame in frames:
-                    self._queue.put_nowait(
-                        tts.SynthesizedAudio(text=self._text, data=frame)
+            for frame in decoder.decode_chunk(data):
+                for frame in bstream.write(frame.data):
+                    self._event_ch.send_nowait(
+                        tts.SynthesizedAudio(
+                            request_id=request_id, segment_id=segment_id, frame=frame
+                        )
                     )
-            else:
-                self._queue.put_nowait(
+
+            for frame in bstream.flush():
+                self._event_ch.send_nowait(
                     tts.SynthesizedAudio(
-                        text="",
-                        data=rtc.AudioFrame(
-                            data=data,
-                            sample_rate=self._opts.audio_config.sample_rate_hertz,
-                            num_channels=1,
-                            samples_per_channel=len(data) // 2,  # 16-bit
-                        ),
+                        request_id=request_id, segment_id=segment_id, frame=frame
                     )
                 )
+        else:
+            data = data[44:]  # skip WAV header
+            self._event_ch.send_nowait(
+                tts.SynthesizedAudio(
+                    request_id=request_id,
+                    segment_id=segment_id,
+                    frame=rtc.AudioFrame(
+                        data=data,
+                        sample_rate=self._opts.audio_config.sample_rate_hertz,
+                        num_channels=1,
+                        samples_per_channel=len(data) // 2,  # 16-bit
+                    ),
+                )
+            )
 
-        except Exception:
-            logger.exception("failed to synthesize")
-        finally:
-            self._queue.put_nowait(None)
 
-    async def __anext__(self) -> tts.SynthesizedAudio:
-        if not self._main_task:
-            self._main_task = asyncio.create_task(self._run())
+def _gender_from_str(gender: str) -> SsmlVoiceGender:
+    ssml_gender = SsmlVoiceGender.NEUTRAL
+    if gender == "male":
+        ssml_gender = SsmlVoiceGender.MALE
+    elif gender == "female":
+        ssml_gender = SsmlVoiceGender.FEMALE
 
-        frame = await self._queue.get()
-        if frame is None:
-            raise StopAsyncIteration
-
-        return frame
-
-    async def aclose(self) -> None:
-        if not self._main_task:
-            return
-
-        self._main_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._main_task
+    return ssml_gender  # type: ignore

@@ -13,31 +13,88 @@ on:
 
 jobs:
   tests:
-    name: Run tests
-    runs-on: ubuntu-latest
+    # don't run tests for PRs on forks
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14-large
+            platform: macos
+          - os: macos-14
+            platform: macos
+          - os: windows-2019
+            platform: windows
+          - os: ubuntu-20.04
+            platform: linux
+          - os: namespace-profile-default-arm64
+            platform: linux
+
+    runs-on: ${{ matrix.os }}
+    name: Run tests (${{ matrix.os }})
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
           lfs: true
 
-      - uses: actions/setup-python@v5
+      - name: Cache packages
+        uses: actions/cache@v4
         with:
-          python-version: '3.9'
-          cache: 'pip'
+          path: |
+            /var/cache/apt/archives
+            ~/Library/Caches/Homebrew
+            C:\ProgramData\chocolatey\lib\ffmpeg
+          key: ${{ runner.os }}-cache
+          restore-keys: |
+            ${{ runner.os }}-cache
 
-      - name: install ffmpeg
+      - uses: actions/setup-python@v5
+        # on mac, ffmpeg installs python
+        if: ${{ matrix.os != 'macos' }}
+        with:
+          python-version: "3.9"
+          cache: "pip"
+
+      - name: Install ffmpeg (Linux)
+        if: ${{ matrix.platform == 'linux' }}
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: install packages
+      # Azure plugin fails with OpenSSL3, and Ubuntu 22.04 does not include libssl1.1 in its repos
+      - name: Install libssl 1.1 (Linux 22.04)
+        if: ${{ matrix.os == 'namespace-profile-default-arm64' }}
+        run: |
+          wget https://old-releases.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1-1ubuntu2.1_arm64.deb
+          wget https://old-releases.ubuntu.com/ubuntu/pool/main/o/openssl/libssl-dev_1.1.1-1ubuntu2.1_arm64.deb
+          sudo dpkg -i libssl1.1_1.1.1-1ubuntu2.1_arm64.deb
+          sudo dpkg -i libssl-dev_1.1.1-1ubuntu2.1_arm64.deb
+
+      - name: Install ffmpeg (macOS)
+        if: ${{ matrix.platform == 'macos' }}
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: ${{ matrix.platform == 'windows' }}
+        run: choco install ffmpeg
+
+      - name: Install packages
+        shell: bash
         run: |
           pip3 install pytest pytest-asyncio pytest-timeout './livekit-agents[codecs]' psutil
           pip3 install -r ./tests/test-requirements.txt
-          for dir in livekit-plugins/*; do
-            pip3 install $dir
-          done
+          pip3 install ./livekit-agents \
+                      ./livekit-plugins/livekit-plugins-openai \
+                      ./livekit-plugins/livekit-plugins-deepgram \
+                      ./livekit-plugins/livekit-plugins-google \
+                      ./livekit-plugins/livekit-plugins-nltk \
+                      ./livekit-plugins/livekit-plugins-silero \
+                      ./livekit-plugins/livekit-plugins-elevenlabs \
+                      ./livekit-plugins/livekit-plugins-cartesia \
+                      ./livekit-plugins/livekit-plugins-azure \
+                      ./livekit-plugins/livekit-plugins-anthropic
 
       - name: Run tests
+        shell: bash
         env:
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
           LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
@@ -49,6 +106,7 @@ jobs:
           AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
           AZURE_SPEECH_REGION: ${{ secrets.AZURE_SPEECH_REGION }} # nit: doesn't have to be secret
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_APPLICATION_CREDENTIALS: google.json
         run: |
           echo $GOOGLE_CREDENTIALS_JSON > google.json

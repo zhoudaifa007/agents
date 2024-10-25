@@ -1,3 +1,11 @@
-from .assistant import AssistantContext, VoiceAssistant
+from ..pipeline import AgentCallContext, AgentTranscriptionOptions, VoicePipelineAgent
 
-__all__ = ["VoiceAssistant", "AssistantContext"]
+AssistantTranscriptionOptions = AgentTranscriptionOptions
+AssistantCallContext = AgentCallContext
+VoiceAssistant = VoicePipelineAgent
+
+__all__ = [
+    "AssistantTranscriptionOptions",
+    "AssistantCallContext",
+    "VoiceAssistant",
+]

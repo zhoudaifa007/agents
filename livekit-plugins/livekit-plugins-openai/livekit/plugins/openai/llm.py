@@ -15,34 +15,37 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import enum
-import functools
-import inspect
-import json
+import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, MutableSet, Tuple
+from typing import Any, Awaitable, MutableSet
 
-from livekit import rtc
+import httpx
 from livekit.agents import llm
-from livekit.agents.utils import images
 
 import openai
+from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
+from openai.types.chat.chat_completion_chunk import Choice
 
 from .log import logger
-from .models import ChatModels
-from .utils import get_base_url
-
-IMAGE_DETAIL_DIMENSIONS: List[Tuple[int, str]] = [
-    (512, "low"),
-    (768, "medium"),
-    (2048, "high"),
-]
+from .models import (
+    CerebrasChatModels,
+    ChatModels,
+    DeepSeekChatModels,
+    GroqChatModels,
+    OctoChatModels,
+    PerplexityChatModels,
+    TelnyxChatModels,
+    TogetherChatModels,
+    XAIChatModels,
+)
+from .utils import AsyncAzureADTokenProvider, build_oai_message
 
 
 @dataclass
 class LLMOptions:
     model: str | ChatModels
+    user: str | None
+    temperature: float | None
 
 
 class LLM(llm.LLM):
@@ -50,294 +53,549 @@ class LLM(llm.LLM):
         self,
         *,
         model: str | ChatModels = "gpt-4o",
+        api_key: str | None = None,
         base_url: str | None = None,
+        user: str | None = None,
         client: openai.AsyncClient | None = None,
+        temperature: float | None = None,
     ) -> None:
-        self._opts = LLMOptions(model=model)
-        self._client = client or openai.AsyncClient(base_url=get_base_url(base_url))
-        self._running_fncs: MutableSet[asyncio.Task] = set()
+        """
+        Create a new instance of OpenAI LLM.
 
-    async def chat(
+        ``api_key`` must be set to your OpenAI API key, either using the argument or by setting the
+        ``OPENAI_API_KEY`` environmental variable.
+        """
+        # throw an error on our end
+        api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if api_key is None:
+            raise ValueError("OpenAI API key is required")
+
+        self._opts = LLMOptions(model=model, user=user, temperature=temperature)
+        self._client = client or openai.AsyncClient(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
+                follow_redirects=True,
+                limits=httpx.Limits(
+                    max_connections=50,
+                    max_keepalive_connections=50,
+                    keepalive_expiry=120,
+                ),
+            ),
+        )
+        self._running_fncs: MutableSet[asyncio.Task[Any]] = set()
+
+    @staticmethod
+    def with_azure(
+        *,
+        model: str | ChatModels = "gpt-4o",
+        azure_endpoint: str | None = None,
+        azure_deployment: str | None = None,
+        api_version: str | None = None,
+        api_key: str | None = None,
+        azure_ad_token: str | None = None,
+        azure_ad_token_provider: AsyncAzureADTokenProvider | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+        base_url: str | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        This automatically infers the following arguments from their corresponding environment variables if they are not provided:
+        - `api_key` from `AZURE_OPENAI_API_KEY`
+        - `organization` from `OPENAI_ORG_ID`
+        - `project` from `OPENAI_PROJECT_ID`
+        - `azure_ad_token` from `AZURE_OPENAI_AD_TOKEN`
+        - `api_version` from `OPENAI_API_VERSION`
+        - `azure_endpoint` from `AZURE_OPENAI_ENDPOINT`
+        """
+
+        azure_client = openai.AsyncAzureOpenAI(
+            azure_endpoint=azure_endpoint,
+            azure_deployment=azure_deployment,
+            api_version=api_version,
+            api_key=api_key,
+            azure_ad_token=azure_ad_token,
+            azure_ad_token_provider=azure_ad_token_provider,
+            organization=organization,
+            project=project,
+            base_url=base_url,
+        )  # type: ignore
+
+        return LLM(model=model, client=azure_client, user=user, temperature=temperature)
+
+    @staticmethod
+    def with_cerebras(
+        *,
+        model: str | CerebrasChatModels = "llama3.1-8b",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.cerebras.ai/v1",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of Cerebras LLM.
+
+        ``api_key`` must be set to your Cerebras API key, either using the argument or by setting
+        the ``CEREBRAS_API_KEY`` environmental variable.
+        """
+
+        # shim for not using OPENAI_API_KEY
+        api_key = api_key or os.environ.get("CEREBRAS_API_KEY")
+        if api_key is None:
+            raise ValueError("Cerebras API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_fireworks(
+        *,
+        model: str = "accounts/fireworks/models/llama-v3p1-70b-instruct",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.fireworks.ai/inference/v1",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of Fireworks LLM.
+
+        ``api_key`` must be set to your Fireworks API key, either using the argument or by setting
+        the ``FIREWORKS_API_KEY`` environmental variable.
+        """
+
+        # shim for not using OPENAI_API_KEY
+        api_key = api_key or os.environ.get("FIREWORKS_API_KEY")
+        if api_key is None:
+            raise ValueError("Fireworks API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_x_ai(
+        *,
+        model: str | XAIChatModels = "grok-2-public",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.x.ai/v1",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ):
+        """
+        Create a new instance of XAI LLM.
+
+        ``api_key`` must be set to your XAI API key, either using the argument or by setting
+        the ``XAI_API_KEY`` environmental variable.
+        """
+        api_key = api_key or os.environ.get("XAI_API_KEY")
+        if api_key is None:
+            raise ValueError("XAI API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_groq(
+        *,
+        model: str | GroqChatModels = "llama3-8b-8192",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.groq.com/openai/v1",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of Groq LLM.
+
+        ``api_key`` must be set to your Groq API key, either using the argument or by setting
+        the ``GROQ_API_KEY`` environmental variable.
+        """
+
+        # shim for not using OPENAI_API_KEY
+        api_key = api_key or os.environ.get("GROQ_API_KEY")
+        if api_key is None:
+            raise ValueError("Groq API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_deepseek(
+        *,
+        model: str | DeepSeekChatModels = "deepseek-chat",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.deepseek.com/v1",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of DeepSeek LLM.
+
+        ``api_key`` must be set to your DeepSeek API key, either using the argument or by setting
+        the ``DEEPSEEK_API_KEY`` environmental variable.
+        """
+
+        # shim for not using OPENAI_API_KEY
+        api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+        if api_key is None:
+            raise ValueError("DeepSeek API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_octo(
+        *,
+        model: str | OctoChatModels = "llama-2-13b-chat",
+        api_key: str | None = None,
+        base_url: str | None = "https://text.octoai.run/v1",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of OctoAI LLM.
+
+        ``api_key`` must be set to your OctoAI API key, either using the argument or by setting
+        the ``OCTOAI_TOKEN`` environmental variable.
+        """
+
+        # shim for not using OPENAI_API_KEY
+        api_key = api_key or os.environ.get("OCTOAI_TOKEN")
+        if api_key is None:
+            raise ValueError("OctoAI API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_ollama(
+        *,
+        model: str = "llama3.1",
+        base_url: str | None = "http://localhost:11434/v1",
+        client: openai.AsyncClient | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of Ollama LLM.
+        """
+
+        return LLM(
+            model=model,
+            api_key="ollama",
+            base_url=base_url,
+            client=client,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_perplexity(
+        *,
+        model: str | PerplexityChatModels = "llama-3.1-sonar-small-128k-chat",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.perplexity.ai",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_together(
+        *,
+        model: str | TogetherChatModels = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.together.xyz/v1",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of TogetherAI LLM.
+
+        ``api_key`` must be set to your TogetherAI API key, either using the argument or by setting
+        the ``TOGETHER_API_KEY`` environmental variable.
+        """
+
+        # shim for not using OPENAI_API_KEY
+        api_key = api_key or os.environ.get("TOGETHER_API_KEY")
+        if api_key is None:
+            raise ValueError("TogetherAI API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def with_telnyx(
+        *,
+        model: str | TelnyxChatModels = "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        api_key: str | None = None,
+        base_url: str | None = "https://api.telnyx.com/v2/ai",
+        client: openai.AsyncClient | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        """
+        Create a new instance of Telnyx LLM.
+
+        ``api_key`` must be set to your Telnyx API key, either using the argument or by setting
+        the ``TELNYX_API_KEY`` environmental variable.
+        """
+
+        # shim for not using OPENAI_API_KEY
+        api_key = api_key or os.environ.get("TELNYX_API_KEY")
+        if api_key is None:
+            raise ValueError("Telnyx API key is required")
+
+        return LLM(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            client=client,
+            user=user,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def create_azure_client(
+        *,
+        model: str | ChatModels = "gpt-4o",
+        azure_endpoint: str | None = None,
+        azure_deployment: str | None = None,
+        api_version: str | None = None,
+        api_key: str | None = None,
+        azure_ad_token: str | None = None,
+        azure_ad_token_provider: AsyncAzureADTokenProvider | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+        base_url: str | None = None,
+        user: str | None = None,
+        temperature: float | None = None,
+    ) -> LLM:
+        logger.warning("This alias is deprecated. Use LLM.with_azure() instead")
+        return LLM.with_azure(
+            model=model,
+            azure_endpoint=azure_endpoint,
+            api_version=api_version,
+            api_key=api_key,
+            azure_ad_token=azure_ad_token,
+            azure_ad_token_provider=azure_ad_token_provider,
+            organization=organization,
+            project=project,
+            base_url=base_url,
+            user=user,
+            temperature=temperature,
+        )
+
+    def chat(
         self,
-        history: llm.ChatContext,
+        *,
+        chat_ctx: llm.ChatContext,
         fnc_ctx: llm.FunctionContext | None = None,
         temperature: float | None = None,
         n: int | None = 1,
+        parallel_tool_calls: bool | None = None,
     ) -> "LLMStream":
-        opts = dict()
-        if fnc_ctx:
-            opts["tools"] = to_openai_tools(fnc_ctx)
+        opts: dict[str, Any] = dict()
+        if fnc_ctx and len(fnc_ctx.ai_functions) > 0:
+            fncs_desc = []
+            for fnc in fnc_ctx.ai_functions.values():
+                fncs_desc.append(llm._oai_api.build_oai_function_description(fnc))
 
-        messages = self._to_openai_ctx(history)
-        cmp = await self._client.chat.completions.create(
+            opts["tools"] = fncs_desc
+
+            if fnc_ctx and parallel_tool_calls is not None:
+                opts["parallel_tool_calls"] = parallel_tool_calls
+
+        user = self._opts.user or openai.NOT_GIVEN
+        if temperature is None:
+            temperature = self._opts.temperature
+
+        messages = _build_oai_context(chat_ctx, id(self))
+
+        cmp = self._client.chat.completions.create(
             messages=messages,
             model=self._opts.model,
             n=n,
             temperature=temperature,
             stream=True,
+            user=user,
             **opts,
         )
 
-        return LLMStream(cmp, fnc_ctx)
-
-    def _to_openai_ctx(self, history: llm.ChatContext):
-        res = []
-
-        for msg in history.messages:
-            content: List[Dict[str, Any]] = [{"type": "text", "text": msg.text}]
-            for img in msg.images:
-                if isinstance(img.image, str):
-                    content.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": img.image,
-                                "detail": image_detail_from_dimensions(
-                                    img.inference_width or 512,
-                                    img.inference_height or 512,
-                                ),
-                            },
-                        }
-                    )
-                elif isinstance(img.image, rtc.VideoFrame):
-                    if self not in img._cache:
-                        w, h = img.inference_width, img.inference_height
-                        encode_options = images.EncodeOptions(
-                            format="JPEG",
-                            resize_options=images.ResizeOptions(
-                                width=w or 128,
-                                height=h or 128,
-                                strategy="center_aspect_fit",
-                            ),
-                        )
-                        jpg_bytes = images.encode(img.image, encode_options)
-                        b64 = base64.b64encode(jpg_bytes).decode("utf-8")
-                        img._cache[self] = b64
-
-                    content.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{img._cache[self]}"
-                            },
-                        }
-                    )
-                else:
-                    logger.error(f"unknown image type {type(img)}")
-                    continue
-
-            res.append(
-                {
-                    "role": msg.role.value,
-                    "content": content,
-                }
-            )
-
-        return res
+        return LLMStream(oai_stream=cmp, chat_ctx=chat_ctx, fnc_ctx=fnc_ctx)
 
 
 class LLMStream(llm.LLMStream):
     def __init__(
-        self, oai_stream: openai.AsyncStream, fnc_ctx: llm.FunctionContext | None
+        self,
+        *,
+        oai_stream: Awaitable[openai.AsyncStream[ChatCompletionChunk]],
+        chat_ctx: llm.ChatContext,
+        fnc_ctx: llm.FunctionContext | None,
     ) -> None:
-        super().__init__()
-        self._oai_stream = oai_stream
-        self._fnc_ctx = fnc_ctx
-        self._running_fncs: MutableSet[asyncio.Task] = set()
+        super().__init__(chat_ctx=chat_ctx, fnc_ctx=fnc_ctx)
+        self._awaitable_oai_stream = oai_stream
+        self._oai_stream: openai.AsyncStream[ChatCompletionChunk] | None = None
 
-    def __aiter__(self) -> "LLMStream":
-        return self
+        # current function call that we're waiting for full completion (args are streamed)
+        self._tool_call_id: str | None = None
+        self._fnc_name: str | None = None
+        self._fnc_raw_arguments: str | None = None
 
-    async def __anext__(self) -> llm.ChatChunk:
-        fnc_name = None
-        fnc_args = None
-        fnc_idx = None
+    async def aclose(self) -> None:
+        if self._oai_stream:
+            await self._oai_stream.close()
+
+        return await super().aclose()
+
+    async def __anext__(self):
+        if not self._oai_stream:
+            self._oai_stream = await self._awaitable_oai_stream
 
         async for chunk in self._oai_stream:
-            for i, choice in enumerate(chunk.choices):
-                delta = choice.delta
-
-                if delta.tool_calls:
-                    for tool in delta.tool_calls:
-                        finfo = tool.function
-                        assert finfo is not None
-
-                        if tool.index != fnc_idx and fnc_idx is not None:
-                            await self._call_function(fnc_name, fnc_args)
-                            fnc_name = fnc_args = fnc_idx = None
-
-                        if finfo.name:
-                            if fnc_idx is not None:
-                                logger.warning(
-                                    "new fnc call while previous call is still running"
-                                )
-                            fnc_name = finfo.name
-                            fnc_args = finfo.arguments
-                            fnc_idx = tool.index
-                        else:
-                            assert fnc_name is not None
-                            assert fnc_args is not None
-                            assert fnc_idx is not None
-
-                            if finfo.arguments:
-                                fnc_args += finfo.arguments
-                    continue
-
-                if choice.finish_reason == "tool_calls":
-                    await self._call_function(fnc_name, fnc_args)
-                    continue
-
-                return llm.ChatChunk(
-                    choices=[
-                        llm.Choice(
-                            delta=llm.ChoiceDelta(
-                                content=delta.content,
-                                role=delta.role,
-                            ),
-                            index=i,
-                        )
-                    ]
-                )
+            for choice in chunk.choices:
+                chat_chunk = self._parse_choice(choice)
+                if chat_chunk is not None:
+                    return chat_chunk
 
         raise StopAsyncIteration
 
-    async def _call_function(
-        self,
-        name: str | None = None,
-        arguments: str | None = None,
-    ) -> None:
-        assert self._fnc_ctx
+    def _parse_choice(self, choice: Choice) -> llm.ChatChunk | None:
+        delta = choice.delta
 
-        if name is None:
-            logger.error("received tool call but no function name")
-            return
+        # https://github.com/livekit/agents/issues/688
+        # the delta can be None when using Azure OpenAI using content filtering
+        if delta is None:
+            return None
 
-        fncs = self._fnc_ctx.ai_functions
-        if name not in fncs:
-            logger.warning(f"function {name} not found in function context")
-            return
+        if delta.tool_calls:
+            # check if we have functions to calls
+            for tool in delta.tool_calls:
+                if not tool.function:
+                    continue  # oai may add other tools in the future
 
-        if arguments is None:
-            logger.warning(f"received tool call but no arguments for function {name}")
-            return
+                call_chunk = None
+                if self._tool_call_id and tool.id and tool.id != self._tool_call_id:
+                    call_chunk = self._try_run_function(choice)
 
-        args = {}
-        if arguments:
-            try:
-                args = json.loads(arguments)
-            except json.JSONDecodeError:
-                # TODO(theomonnom): Try to recover from invalid json
-                logger.exception(f"failed to decode arguments for tool call {name}")
-                return
+                if tool.function.name:
+                    self._tool_call_id = tool.id
+                    self._fnc_name = tool.function.name
+                    self._fnc_raw_arguments = tool.function.arguments or ""
+                elif tool.function.arguments:
+                    self._fnc_raw_arguments += tool.function.arguments  # type: ignore
 
-        fnc = fncs[name]
-        # validate args before calling fnc
-        for arg in fnc.args.values():
-            if arg.name not in args:
-                if arg.default is inspect.Parameter.empty:
-                    logger.error(
-                        f"missing required arg {arg.name} for ai_callable {name}"
-                    )
-                    return
-                continue
+                if call_chunk is not None:
+                    return call_chunk
 
-            if arg.type is bool and args[arg.name] not in (True, False):
-                logger.error(f"invalid arg {arg.name} for ai_callable {name}")
-                return
+        if choice.finish_reason in ("tool_calls", "stop") and self._tool_call_id:
+            # we're done with the tool calls, run the last one
+            return self._try_run_function(choice)
 
-            if arg.type is int and not isinstance(args[arg.name], int):
-                logger.error(f"invalid arg {arg.name} for ai_callable {name}")
-                return
-
-            if arg.type is float and not isinstance(args[arg.name], float):
-                logger.error(f"invalid arg {arg.name} for ai_callable {name}")
-                return
-
-            if arg.type is str and not isinstance(args[arg.name], str):
-                logger.error(f"invalid arg {arg.name} for ai_callable {name}")
-                return
-
-            if issubclass(arg.type, enum.Enum):
-                values = set(item.value for item in arg.type)
-                if args[arg.name] not in values:
-                    logger.error(f"invalid arg {arg.name} for ai_callable {name}")
-                    return
-
-        logger.debug(f"calling function {name} with arguments {args}")
-        self._called_functions.append(
-            llm.CalledFunction(fnc_name=name, fnc=fnc.fnc, args=args)
-        )
-        func = functools.partial(fnc.fnc, **args)
-        if asyncio.iscoroutinefunction(fnc.fnc):
-            task = asyncio.create_task(func())
-        else:
-            task = asyncio.create_task(asyncio.to_thread(func))
-
-        def _task_done(task: asyncio.Task) -> None:
-            if not task.cancelled() and task.exception():
-                logger.error("ai_callable task failed", exc_info=task.exception())
-            self._running_fncs.discard(task)
-
-        task.add_done_callback(_task_done)
-        self._running_fncs.add(task)
-
-    async def aclose(self, wait: bool = True) -> None:
-        if not wait:
-            for task in self._running_fncs:
-                task.cancel()
-
-        await asyncio.gather(*self._running_fncs, return_exceptions=True)
-
-
-def image_detail_from_dimensions(width: int, height: int) -> str:
-    deltas = [
-        (min(abs(width - d[0]), abs(height - d[0])), d[1])
-        for d in IMAGE_DETAIL_DIMENSIONS
-    ]
-    smallest_delta = min(deltas, key=lambda d: d[0])
-    return smallest_delta[1]
-
-
-def to_openai_tools(fnc_ctx: llm.FunctionContext):
-    tools = []
-    for fnc in fnc_ctx.ai_functions.values():
-        plist = {}
-        required = []
-        for arg_name, arg in fnc.args.items():
-            p: Dict[str, Any] = {}
-            if arg.desc:
-                p["description"] = arg.desc
-
-            if arg.type is str:
-                p["type"] = "string"
-            elif arg.type is int:
-                p["type"] = "int"
-            elif arg.type is float:
-                p["type"] = "float"
-            elif arg.type is bool:
-                p["type"] = "boolean"
-            elif issubclass(arg.type, enum.Enum):
-                p["type"] = "string"
-                p["enum"] = [e.value for e in arg.type]
-
-            plist[arg_name] = p
-
-            if arg.default is inspect.Parameter.empty:
-                required.append(arg_name)
-
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": fnc.metadata.name,
-                    "description": fnc.metadata.desc,
-                    "parameters": {
-                        "type": "object",
-                        "properties": plist,
-                        "required": required,
-                    },
-                },
-            }
+        return llm.ChatChunk(
+            choices=[
+                llm.Choice(
+                    delta=llm.ChoiceDelta(content=delta.content, role="assistant"),
+                    index=choice.index,
+                )
+            ]
         )
 
-    return tools
+    def _try_run_function(self, choice: Choice) -> llm.ChatChunk | None:
+        if not self._fnc_ctx:
+            logger.warning("oai stream tried to run function without function context")
+            return None
+
+        if self._tool_call_id is None:
+            logger.warning(
+                "oai stream tried to run function but tool_call_id is not set"
+            )
+            return None
+
+        if self._fnc_name is None or self._fnc_raw_arguments is None:
+            logger.warning(
+                "oai stream tried to call a function but raw_arguments and fnc_name are not set"
+            )
+            return None
+
+        fnc_info = llm._oai_api.create_ai_function_info(
+            self._fnc_ctx, self._tool_call_id, self._fnc_name, self._fnc_raw_arguments
+        )
+
+        self._tool_call_id = self._fnc_name = self._fnc_raw_arguments = None
+        self._function_calls_info.append(fnc_info)
+
+        return llm.ChatChunk(
+            choices=[
+                llm.Choice(
+                    delta=llm.ChoiceDelta(
+                        role="assistant",
+                        tool_calls=[fnc_info],
+                        content=choice.delta.content,
+                    ),
+                    index=choice.index,
+                )
+            ]
+        )
+
+
+def _build_oai_context(
+    chat_ctx: llm.ChatContext, cache_key: Any
+) -> list[ChatCompletionMessageParam]:
+    return [build_oai_message(msg, cache_key) for msg in chat_ctx.messages]  # type: ignore
