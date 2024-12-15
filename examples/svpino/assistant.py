@@ -9,7 +9,8 @@ from livekit.agents.llm import (
     ChatMessage,
     ChatRole,
 )
-from livekit.agents.voice_assistant import AssistantContext, VoiceAssistant
+from livekit.agents.pipeline import AgentCallContext
+from livekit.agents.voice_assistant import VoiceAssistant
 from livekit.plugins import deepgram, openai, silero
 
 
@@ -30,7 +31,7 @@ class AssistantFunction(agents.llm.FunctionContext):
         ],
     ):
         print(f"Message triggering vision capabilities: {user_msg}")
-        context = AssistantContext.get_current()
+        context = AgentCallContext.get_current()
         context.store_metadata("user_msg", user_msg)
 
 
@@ -112,7 +113,7 @@ async def entrypoint(ctx: JobContext):
             asyncio.create_task(_answer(msg.message, use_image=False))
 
     @assistant.on("function_calls_finished")
-    def on_function_calls_finished(ctx: AssistantContext):
+    def on_function_calls_finished(ctx: AgentCallContext):
         """This event triggers when an assistant's function call completes."""
 
         user_msg = ctx.get_metadata("user_msg")
