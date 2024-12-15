@@ -15,26 +15,30 @@
 from __future__ import annotations
 
 import dataclasses
-import io
 import os
-import wave
 from dataclasses import dataclass
 
 import httpx
-from livekit import agents
-from livekit.agents import stt
+from livekit import rtc
+from livekit.agents import (
+    APIConnectionError,
+    APIConnectOptions,
+    APIStatusError,
+    APITimeoutError,
+    stt,
+)
 from livekit.agents.utils import AudioBuffer
 
 import openai
 
-from .models import WhisperModels, GroqAudioModels
+from .models import GroqAudioModels, WhisperModels
 
 
 @dataclass
 class _STTOptions:
     language: str
     detect_language: bool
-    model: WhisperModels
+    model: WhisperModels | str
 
 
 class STT(stt.STT):
@@ -43,7 +47,7 @@ class STT(stt.STT):
         *,
         language: str = "en",
         detect_language: bool = False,
-        model: WhisperModels = "whisper-1",
+        model: WhisperModels | str = "whisper-1",
         base_url: str | None = None,
         api_key: str | None = None,
         client: openai.AsyncClient | None = None,
@@ -68,6 +72,7 @@ class STT(stt.STT):
         )
 
         self._client = client or openai.AsyncClient(
+            max_retries=0,
             api_key=api_key,
             base_url=base_url,
             http_client=httpx.AsyncClient(
@@ -81,11 +86,19 @@ class STT(stt.STT):
             ),
         )
 
-    
+    def update_options(
+        self,
+        *,
+        model: WhisperModels | GroqAudioModels | None = None,
+        language: str | None = None,
+    ) -> None:
+        self._opts.model = model or self._opts.model
+        self._opts.language = language or self._opts.language
+
     @staticmethod
     def with_groq(
         *,
-        model: GroqAudioModels = "whisper-large-v3-turbo",
+        model: GroqAudioModels | str = "whisper-large-v3-turbo",
         api_key: str | None = None,
         base_url: str | None = "https://api.groq.com/openai/v1",
         client: openai.AsyncClient | None = None,
@@ -98,13 +111,11 @@ class STT(stt.STT):
         ``api_key`` must be set to your Groq API key, either using the argument or by setting
         the ``GROQ_API_KEY`` environmental variable.
         """
-        
-        # Use environment variable if API key is not provided
+
         api_key = api_key or os.environ.get("GROQ_API_KEY")
         if api_key is None:
             raise ValueError("Groq API key is required")
 
-        # Instantiate and return a configured STT instance
         return STT(
             model=model,
             api_key=api_key,
@@ -119,28 +130,47 @@ class STT(stt.STT):
         config.language = language or config.language
         return config
 
-    async def recognize(
-        self, buffer: AudioBuffer, *, language: str | None = None
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: str | None,
+        conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
-        config = self._sanitize_options(language=language)
-        buffer = agents.utils.merge_frames(buffer)
-        io_buffer = io.BytesIO()
-        with wave.open(io_buffer, "wb") as wav:
-            wav.setnchannels(buffer.num_channels)
-            wav.setsampwidth(2)  # 16-bit
-            wav.setframerate(buffer.sample_rate)
-            wav.writeframes(buffer.data)
+        try:
+            config = self._sanitize_options(language=language)
+            data = rtc.combine_audio_frames(buffer).to_wav_bytes()
+            resp = await self._client.audio.transcriptions.create(
+                file=(
+                    "file.wav",
+                    data,
+                    "audio/wav",
+                ),
+                model=self._opts.model,
+                language=config.language,
+                # verbose_json returns language and other details
+                response_format="verbose_json",
+                timeout=httpx.Timeout(30, connect=conn_options.timeout),
+            )
 
-        resp = await self._client.audio.transcriptions.create(
-            file=("my_file.wav", io_buffer.getvalue(), "audio/wav"),
-            model=self._opts.model,
-            language=config.language,
-            response_format="json",
-        )
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[
+                    stt.SpeechData(
+                        text=resp.text or "",
+                        language=resp.language or config.language or "",
+                    )
+                ],
+            )
 
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[
-                stt.SpeechData(text=resp.text or "", language=language or "")
-            ],
-        )
+        except openai.APITimeoutError:
+            raise APITimeoutError()
+        except openai.APIStatusError as e:
+            raise APIStatusError(
+                e.message,
+                status_code=e.status_code,
+                request_id=e.request_id,
+                body=e.body,
+            )
+        except Exception as e:
+            raise APIConnectionError() from e
