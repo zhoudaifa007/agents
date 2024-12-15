@@ -3,18 +3,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import AsyncIterable, Literal, overload
+from typing import AsyncIterable, Literal, Optional, Union, cast, overload
 from urllib.parse import urlencode
 
 import aiohttp
 from livekit import rtc
 from livekit.agents import llm, utils
-from livekit.agents.llm import _oai_api
+from livekit.agents.metrics import MultimodalLLMError, MultimodalLLMMetrics
 from typing_extensions import TypedDict
 
-from . import api_proto
+from .._oai_api import build_oai_function_description, create_ai_function_info
+from . import api_proto, remote_items
 from .log import logger
 
 EventTypes = Literal[
@@ -31,6 +33,9 @@ EventTypes = Literal[
     "response_content_done",
     "response_output_done",
     "response_done",
+    "function_calls_collected",
+    "function_calls_finished",
+    "metrics_collected",
 ]
 
 
@@ -60,8 +65,14 @@ class RealtimeResponse:
     """details of the status (only with "incomplete, cancelled and failed")"""
     output: list[RealtimeOutput]
     """list of outputs"""
+    usage: api_proto.Usage | None
+    """usage of the response"""
     done_fut: asyncio.Future[None]
     """future that will be set when the response is completed"""
+    _created_timestamp: float
+    """timestamp when the response was created"""
+    _first_token_timestamp: float | None = None
+    """timestamp when the first token was received"""
 
 
 @dataclass
@@ -114,6 +125,8 @@ class RealtimeContent:
     """stream of audio content"""
     tool_calls: list[RealtimeToolCall]
     """pending tool calls"""
+    content_type: api_proto.Modality
+    """type of the content"""
 
 
 @dataclass
@@ -126,6 +139,15 @@ class ServerVadOptions:
 @dataclass
 class InputTranscriptionOptions:
     model: api_proto.InputTranscriptionModel | str
+
+
+@dataclass
+class RealtimeError:
+    event_id: str
+    type: str
+    message: str
+    code: Optional[str]
+    param: Optional[str]
 
 
 @dataclass
@@ -479,25 +501,67 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
 
         def create(
             self, message: llm.ChatMessage, previous_item_id: str | None = None
-        ) -> None:
-            message_content = message.content
-            if message_content is None:
-                return
+        ) -> asyncio.Future[bool]:
+            fut = asyncio.Future[bool]()
 
+            message_content = message.content
             tool_call_id = message.tool_call_id
+            if not tool_call_id and message_content is None:
+                # not a function call while the message content is None
+                fut.set_result(False)
+                return fut
             event: api_proto.ClientEvent.ConversationItemCreate | None = None
             if tool_call_id:
-                assert isinstance(message_content, str)
-                event = {
-                    "type": "conversation.item.create",
-                    "previous_item_id": previous_item_id,
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": tool_call_id,
-                        "output": message_content,
-                    },
-                }
+                if message.role == "tool":
+                    # function_call_output
+                    assert isinstance(message_content, str)
+                    event = {
+                        "type": "conversation.item.create",
+                        "previous_item_id": previous_item_id,
+                        "item": {
+                            "id": message.id,
+                            "type": "function_call_output",
+                            "call_id": tool_call_id,
+                            "output": message_content,
+                        },
+                    }
+                else:
+                    # function_call
+                    if not message.tool_calls or message.name is None:
+                        logger.warning(
+                            "function call message has no name or tool calls: %s",
+                            message,
+                            extra=self._sess.logging_extra(),
+                        )
+                        fut.set_result(False)
+                        return fut
+                    if len(message.tool_calls) > 1:
+                        logger.warning(
+                            "function call message has multiple tool calls, "
+                            "only the first one will be used",
+                            extra=self._sess.logging_extra(),
+                        )
+
+                    event = {
+                        "type": "conversation.item.create",
+                        "previous_item_id": previous_item_id,
+                        "item": {
+                            "id": message.id,
+                            "type": "function_call",
+                            "call_id": tool_call_id,
+                            "name": message.name,
+                            "arguments": message.tool_calls[0].raw_arguments,
+                        },
+                    }
             else:
+                if message_content is None:
+                    logger.warning(
+                        "message content is None, skipping: %s",
+                        message,
+                        extra=self._sess.logging_extra(),
+                    )
+                    fut.set_result(False)
+                    return fut
                 if not isinstance(message_content, list):
                     message_content = [message_content]
 
@@ -527,6 +591,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                         "type": "conversation.item.create",
                         "previous_item_id": previous_item_id,
                         "item": {
+                            "id": message.id,
                             "type": "message",
                             "role": "user",
                             "content": user_contents,
@@ -552,6 +617,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                         "type": "conversation.item.create",
                         "previous_item_id": previous_item_id,
                         "item": {
+                            "id": message.id,
                             "type": "message",
                             "role": "assistant",
                             "content": assistant_contents,
@@ -561,16 +627,22 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                     system_contents: list[api_proto.InputTextContent] = []
                     for cnt in message_content:
                         if isinstance(cnt, str):
-                            system_contents.append(
-                                {
-                                    "type": "input_text",
-                                    "text": cnt,
-                                }
-                            )
+                            system_contents.append({"type": "input_text", "text": cnt})
                         elif isinstance(cnt, llm.ChatAudio):
                             logger.warning(
                                 "audio content in system message is not supported"
                             )
+
+                    event = {
+                        "type": "conversation.item.create",
+                        "previous_item_id": previous_item_id,
+                        "item": {
+                            "id": message.id,
+                            "type": "message",
+                            "role": "system",
+                            "content": system_contents,
+                        },
+                    }
 
             if event is None:
                 logger.warning(
@@ -578,13 +650,18 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                     message,
                     extra=self._sess.logging_extra(),
                 )
-                return
+                fut.set_result(False)
+                return fut
 
+            self._sess._item_created_futs[message.id] = fut
             self._sess._queue_msg(event)
+            return fut
 
         def truncate(
             self, *, item_id: str, content_index: int, audio_end_ms: int
-        ) -> None:
+        ) -> asyncio.Future[bool]:
+            fut = asyncio.Future[bool]()
+            self._sess._item_truncated_futs[item_id] = fut
             self._sess._queue_msg(
                 {
                     "type": "conversation.item.truncate",
@@ -593,14 +670,18 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                     "audio_end_ms": audio_end_ms,
                 }
             )
+            return fut
 
-        def delete(self, *, item_id: str) -> None:
+        def delete(self, *, item_id: str) -> asyncio.Future[bool]:
+            fut = asyncio.Future[bool]()
+            self._sess._item_deleted_futs[item_id] = fut
             self._sess._queue_msg(
                 {
                     "type": "conversation.item.delete",
                     "item_id": item_id,
                 }
             )
+            return fut
 
     class Conversation:
         def __init__(self, sess: RealtimeSession) -> None:
@@ -614,8 +695,94 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         def __init__(self, sess: RealtimeSession) -> None:
             self._sess = sess
 
-        def create(self) -> None:
-            self._sess._queue_msg({"type": "response.create"})
+        def create(
+            self,
+            *,
+            on_duplicate: Literal[
+                "cancel_existing", "cancel_new", "keep_both"
+            ] = "keep_both",
+        ) -> asyncio.Future[bool]:
+            """Creates a new response.
+
+            Args:
+                on_duplicate: How to handle when there is an existing response in progress:
+                    - "cancel_existing": Cancel the existing response before creating new one
+                    - "cancel_new": Skip creating new response if one is in progress
+                    - "keep_both": Wait for the existing response to be done and then create a new one
+
+            Returns:
+                Future that resolves when the response create request is queued
+            """
+            if on_duplicate not in ("cancel_existing", "cancel_new", "keep_both"):
+                raise ValueError(
+                    "invalid on_duplicate value, must be one of: "
+                    "cancel_existing, cancel_new, keep_both"
+                )
+
+            # check if there is a pending response creation request sent
+            pending_create_fut = self._sess._response_create_fut
+            if pending_create_fut is not None:
+                if on_duplicate == "cancel_new":
+                    logger.warning(
+                        "skip new response creation due to previous pending response creation",
+                        extra=self._sess.logging_extra(),
+                    )
+                    _fut = asyncio.Future[bool]()
+                    _fut.set_result(False)
+                    return _fut
+
+            active_resp_id = self._sess._active_response_id
+            _logging_extra = {
+                "existing_response_id": active_resp_id,
+                **self._sess.logging_extra(),
+            }
+
+            if (
+                not active_resp_id
+                or self._sess._pending_responses[active_resp_id].done_fut.done()
+            ):
+                # no active response in progress, create a new one
+                self._sess._queue_msg({"type": "response.create"})
+                _fut = asyncio.Future[bool]()
+                _fut.set_result(True)
+                return _fut
+
+            # there is an active response in progress
+            if on_duplicate == "cancel_new":
+                logger.warning(
+                    "skip new response creation due to active response in progress",
+                    extra=_logging_extra,
+                )
+                _fut = asyncio.Future[bool]()
+                _fut.set_result(False)
+                return _fut
+
+            if on_duplicate == "cancel_existing":
+                self.cancel()
+                logger.warning(
+                    "cancelling in-progress response to create a new one",
+                    extra=_logging_extra,
+                )
+            elif on_duplicate == "keep_both":
+                logger.warning(
+                    "waiting for in-progress response to be done "
+                    "before creating a new one",
+                    extra=_logging_extra,
+                )
+
+            # create a task to wait for the previous response and then create new one
+            async def wait_and_create() -> bool:
+                await self._sess._pending_responses[active_resp_id].done_fut
+                logger.info(
+                    "in-progress response is done, creating a new one",
+                    extra=_logging_extra,
+                )
+                new_create_fut = asyncio.Future[None]()
+                self._sess._response_create_fut = new_create_fut
+                self._sess._queue_msg({"type": "response.create"})
+                return True
+
+            return asyncio.create_task(wait_and_create())
 
         def cancel(self) -> None:
             self._sess._queue_msg({"type": "response.cancel"})
@@ -630,11 +797,18 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         loop: asyncio.AbstractEventLoop,
     ) -> None:
         super().__init__()
+        self._label = f"{type(self).__module__}.{type(self).__name__}"
         self._main_atask = asyncio.create_task(
             self._main_task(), name="openai-realtime-session"
         )
+        # manage conversation items internally
+        self._remote_conversation_items = remote_items._RemoteConversationItems()
 
-        self._chat_ctx = chat_ctx
+        # wait for the item to be created or deleted
+        self._item_created_futs: dict[str, asyncio.Future[bool]] = {}
+        self._item_deleted_futs: dict[str, asyncio.Future[bool]] = {}
+        self._item_truncated_futs: dict[str, asyncio.Future[bool]] = {}
+
         self._fnc_ctx = fnc_ctx
         self._loop = loop
 
@@ -643,9 +817,14 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         self._http_session = http_session
 
         self._pending_responses: dict[str, RealtimeResponse] = {}
+        self._active_response_id: str | None = None
+        self._response_create_fut: asyncio.Future[None] | None = None
 
         self._session_id = "not-connected"
         self.session_update()  # initial session init
+
+        # sync the chat context to the session
+        self._init_sync_task = asyncio.create_task(self.set_chat_ctx(chat_ctx))
 
         self._fnc_tasks = utils.aio.TaskSet()
 
@@ -655,10 +834,6 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
 
         self._send_ch.close()
         await self._main_atask
-
-    @property
-    def chat_ctx(self) -> llm.ChatContext:
-        return self._chat_ctx
 
     @property
     def fnc_ctx(self) -> llm.FunctionContext | None:
@@ -721,9 +896,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             for fnc in self._fnc_ctx.ai_functions.values():
                 # the realtime API is using internally-tagged polymorphism.
                 # build_oai_function_description was built for the ChatCompletion API
-                function_data = llm._oai_api.build_oai_function_description(fnc)[
-                    "function"
-                ]
+                function_data = build_oai_function_description(fnc)["function"]
                 function_data["type"] = "function"
                 tools.append(function_data)
 
@@ -766,6 +939,87 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                 "session": session_data,
             }
         )
+
+    def chat_ctx_copy(self) -> llm.ChatContext:
+        return self._remote_conversation_items.to_chat_context()
+
+    async def set_chat_ctx(self, new_ctx: llm.ChatContext) -> None:
+        """Sync the chat context with the agent's chat context.
+
+        Compute the minimum number of insertions and deletions to transform the old
+        chat context messages to the new chat context messages.
+        """
+        original_ctx = self._remote_conversation_items.to_chat_context()
+
+        changes = utils._compute_changes(
+            original_ctx.messages, new_ctx.messages, key_fnc=lambda x: x.id
+        )
+        logger.debug(
+            "sync chat context",
+            extra={
+                "to_delete": [msg.id for msg in changes.to_delete],
+                "to_add": [
+                    (prev.id if prev else None, msg.id) for prev, msg in changes.to_add
+                ],
+            },
+        )
+
+        # append an empty audio message if all new messages are text
+        if changes.to_add and not any(
+            isinstance(msg.content, llm.ChatAudio) for _, msg in changes.to_add
+        ):
+            # Patch: append an empty audio message to set the API in audio mode
+            changes.to_add.append((None, self._create_empty_user_audio_message(1.0)))
+
+        _futs = [
+            self.conversation.item.delete(item_id=msg.id) for msg in changes.to_delete
+        ] + [
+            self.conversation.item.create(msg, prev.id if prev else None)
+            for prev, msg in changes.to_add
+        ]
+
+        # wait for all the futures to complete
+        await asyncio.gather(*_futs)
+
+    def _create_empty_user_audio_message(self, duration: float) -> llm.ChatMessage:
+        """Create an empty audio message with the given duration."""
+        samples = int(duration * api_proto.SAMPLE_RATE)
+        return llm.ChatMessage(
+            role="user",
+            content=llm.ChatAudio(
+                frame=rtc.AudioFrame(
+                    data=b"\x00\x00" * (samples * api_proto.NUM_CHANNELS),
+                    sample_rate=api_proto.SAMPLE_RATE,
+                    num_channels=api_proto.NUM_CHANNELS,
+                    samples_per_channel=samples,
+                )
+            ),
+        )
+
+    def _recover_from_text_response(self, item_id: str | None = None) -> None:
+        """Try to recover from a text response to audio mode.
+
+        Sometimes the OpenAI Realtime API returns text instead of audio responses.
+        This method tries to recover from this by requesting a new response after
+        deleting the text response and creating an empty user audio message.
+        """
+        if item_id:
+            # remove the text response if needed
+            self.conversation.item.delete(item_id=item_id)
+        self.conversation.item.create(self._create_empty_user_audio_message(1.0))
+        self.response.create(on_duplicate="keep_both")
+
+    def _update_conversation_item_content(
+        self, item_id: str, content: llm.ChatContent | list[llm.ChatContent] | None
+    ) -> None:
+        item = self._remote_conversation_items.get(item_id)
+        if item is None:
+            logger.warning(
+                "conversation item not found, skipping update",
+                extra={"item_id": item_id},
+            )
+            return
+        item.content = content
 
     def _queue_msg(self, msg: api_proto.ClientEvents) -> None:
         self._send_ch.send_nowait(msg)
@@ -866,6 +1120,12 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                         self._handle_conversation_item_input_audio_transcription_failed(
                             data
                         )
+                    elif event == "conversation.item.created":
+                        self._handle_conversation_item_created(data)
+                    elif event == "conversation.item.deleted":
+                        self._handle_conversation_item_deleted(data)
+                    elif event == "conversation.item.truncated":
+                        self._handle_conversation_item_truncated(data)
                     elif event == "response.created":
                         self._handle_response_created(data)
                     elif event == "response.output_item.added":
@@ -878,6 +1138,8 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
                         self._handle_response_audio_transcript_delta(data)
                     elif event == "response.audio.done":
                         self._handle_response_audio_done(data)
+                    elif event == "response.text.done":
+                        self._handle_response_text_done(data)
                     elif event == "response.audio_transcript.done":
                         self._handle_response_audio_transcript_done(data)
                     elif event == "response.content_part.done":
@@ -913,6 +1175,17 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             "OpenAI S2S error %s",
             error,
             extra=self.logging_extra(),
+        )
+        error_content = error["error"]
+        self.emit(
+            "error",
+            RealtimeError(
+                event_id=error["event_id"],
+                type=error_content["type"],
+                message=error_content["message"],
+                code=error_content.get("code"),
+                param=error_content.get("param"),
+            ),
         )
 
     def _handle_input_audio_buffer_speech_started(
@@ -961,6 +1234,90 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             ),
         )
 
+    def _handle_conversation_item_created(
+        self, item_created: api_proto.ServerEvent.ConversationItemCreated
+    ):
+        previous_item_id = item_created["previous_item_id"]
+        item = item_created["item"]
+        item_type = item["type"]
+        item_id = item["id"]
+
+        # Create message based on item type
+        # Leave the content empty and fill it in later from the content parts
+        if item_type == "message":
+            # Handle message items (system/user/assistant)
+            item = cast(Union[api_proto.SystemItem, api_proto.UserItem], item)
+            role = item["role"]
+            message = llm.ChatMessage(id=item_id, role=role)
+            if item.get("content"):
+                content = item["content"][0]
+                if content["type"] in ("text", "input_text"):
+                    content = cast(api_proto.InputTextContent, content)
+                    message.content = content["text"]
+                elif content["type"] == "input_audio" and content.get("audio"):
+                    audio_data = base64.b64decode(content["audio"])
+                    message.content = llm.ChatAudio(
+                        frame=rtc.AudioFrame(
+                            data=audio_data,
+                            sample_rate=api_proto.SAMPLE_RATE,
+                            num_channels=api_proto.NUM_CHANNELS,
+                            samples_per_channel=len(audio_data) // 2,
+                        )
+                    )
+
+        elif item_type == "function_call":
+            # Handle function call items
+            item = cast(api_proto.FunctionCallItem, item)
+            message = llm.ChatMessage(
+                id=item_id,
+                role="assistant",
+                name=item["name"],
+                tool_call_id=item["call_id"],
+            )
+
+        elif item_type == "function_call_output":
+            # Handle function call output items
+            item = cast(api_proto.FunctionCallOutputItem, item)
+            message = llm.ChatMessage(
+                id=item_id,
+                role="tool",
+                tool_call_id=item["call_id"],
+                content=item["output"],
+            )
+
+        else:
+            logger.error(
+                f"unknown conversation item type {item_type}",
+                extra=self.logging_extra(),
+            )
+            return
+
+        # Insert into conversation items
+        self._remote_conversation_items.insert_after(previous_item_id, message)
+        if item_id in self._item_created_futs:
+            self._item_created_futs[item_id].set_result(True)
+            del self._item_created_futs[item_id]
+        logger.debug("conversation item created", extra=item_created)
+
+    def _handle_conversation_item_deleted(
+        self, item_deleted: api_proto.ServerEvent.ConversationItemDeleted
+    ):
+        # Delete from conversation items
+        item_id = item_deleted["item_id"]
+        self._remote_conversation_items.delete(item_id)
+        if item_id in self._item_deleted_futs:
+            self._item_deleted_futs[item_id].set_result(True)
+            del self._item_deleted_futs[item_id]
+        logger.debug("conversation item deleted", extra=item_deleted)
+
+    def _handle_conversation_item_truncated(
+        self, item_truncated: api_proto.ServerEvent.ConversationItemTruncated
+    ):
+        item_id = item_truncated["item_id"]
+        if item_id in self._item_truncated_futs:
+            self._item_truncated_futs[item_id].set_result(True)
+            del self._item_truncated_futs[item_id]
+
     def _handle_response_created(
         self, response_created: api_proto.ServerEvent.ResponseCreated
     ):
@@ -972,9 +1329,18 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             status=response["status"],
             status_details=status_details,
             output=[],
+            usage=response.get("usage"),
             done_fut=done_fut,
+            _created_timestamp=time.time(),
         )
         self._pending_responses[new_response.id] = new_response
+        self._active_response_id = new_response.id
+
+        # complete the create future if it exists
+        if self._response_create_fut is not None:
+            self._response_create_fut.set_result(None)
+            self._response_create_fut = None
+
         self.emit("response_created", new_response)
 
     def _handle_response_output_item_added(
@@ -1009,6 +1375,7 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         response = self._pending_responses[response_id]
         output_index = response_content_added["output_index"]
         output = response.output[output_index]
+        content_type = response_content_added["part"]["type"]
 
         text_ch = utils.aio.Chan[str]()
         audio_ch = utils.aio.Chan[rtc.AudioFrame]()
@@ -1023,8 +1390,10 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             text_stream=text_ch,
             audio_stream=audio_ch,
             tool_calls=[],
+            content_type=content_type,
         )
         output.content.append(new_content)
+        response._first_token_timestamp = time.time()
         self.emit("response_content_added", new_content)
 
     def _handle_response_audio_delta(
@@ -1061,6 +1430,12 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         assert isinstance(content.audio_stream, utils.aio.Chan)
         content.audio_stream.close()
 
+    def _handle_response_text_done(
+        self, response_text_done: api_proto.ServerEvent.ResponseTextDone
+    ):
+        content = self._get_content(response_text_done)
+        content.text = response_text_done["text"]
+
     def _handle_response_audio_transcript_done(
         self,
         response_audio_transcript_done: api_proto.ServerEvent.ResponseAudioTranscriptDone,
@@ -1095,12 +1470,22 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             item = response_output_done["item"]
             assert item["type"] == "function_call"
 
-            fnc_call_info = _oai_api.create_ai_function_info(
+            fnc_call_info = create_ai_function_info(
                 self._fnc_ctx,
                 item["call_id"],
                 item["name"],
                 item["arguments"],
             )
+
+            msg = self._remote_conversation_items.get(output.item_id)
+            if msg is not None:
+                # update the content of the message
+                assert msg.tool_call_id == item["call_id"]
+                assert msg.role == "assistant"
+                msg.name = item["name"]
+                msg.tool_calls = [fnc_call_info]
+
+            self.emit("function_calls_collected", [fnc_call_info])
 
             self._fnc_tasks.create_task(
                 self._run_fnc_task(fnc_call_info, output.item_id)
@@ -1113,20 +1498,26 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         response_data = response_done["response"]
         response_id = response_data["id"]
         response = self._pending_responses[response_id]
+        self._active_response_id = None
         response.done_fut.set_result(None)
 
         response.status = response_data["status"]
         response.status_details = response_data.get("status_details")
+        response.usage = response_data.get("usage")
 
+        metrics_error = None
+        cancelled = False
         if response.status == "failed":
             assert response.status_details is not None
 
-            error = response.status_details.get("error")
-            code: str | None = None
-            message: str | None = None
-            if error is not None:
-                code = error.get("code")  # type: ignore
-                message = error.get("message")  # type: ignore
+            error = response.status_details.get("error", {})
+            code: str | None = error.get("code")  # type: ignore
+            message: str | None = error.get("message")  # type: ignore
+            metrics_error = MultimodalLLMError(
+                type=response.status_details.get("type"),
+                code=code,
+                message=message,
+            )
 
             logger.error(
                 "response generation failed",
@@ -1136,12 +1527,56 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
             assert response.status_details is not None
             reason = response.status_details.get("reason")
 
+            metrics_error = MultimodalLLMError(
+                type=response.status_details.get("type"),
+                reason=reason,  # type: ignore
+            )
+
             logger.warning(
                 "response generation incomplete",
                 extra={"reason": reason, **self.logging_extra()},
             )
+        elif response.status == "cancelled":
+            cancelled = True
 
         self.emit("response_done", response)
+
+        # calculate metrics
+        ttft = -1.0
+        if response._first_token_timestamp is not None:
+            ttft = response._first_token_timestamp - response._created_timestamp
+        duration = time.time() - response._created_timestamp
+
+        usage = response.usage or {}  # type: ignore
+        metrics = MultimodalLLMMetrics(
+            timestamp=response._created_timestamp,
+            request_id=response.id,
+            ttft=ttft,
+            duration=duration,
+            cancelled=cancelled,
+            label=self._label,
+            completion_tokens=usage.get("output_tokens", 0),
+            prompt_tokens=usage.get("input_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            tokens_per_second=usage.get("output_tokens", 0) / duration,
+            error=metrics_error,
+            input_token_details=MultimodalLLMMetrics.InputTokenDetails(
+                cached_tokens=usage.get("input_token_details", {}).get(
+                    "cached_tokens", 0
+                ),
+                text_tokens=usage.get("input_token_details", {}).get("text_tokens", 0),
+                audio_tokens=usage.get("input_token_details", {}).get(
+                    "audio_tokens", 0
+                ),
+            ),
+            output_token_details=MultimodalLLMMetrics.OutputTokenDetails(
+                text_tokens=usage.get("output_token_details", {}).get("text_tokens", 0),
+                audio_tokens=usage.get("output_token_details", {}).get(
+                    "audio_tokens", 0
+                ),
+            ),
+        )
+        self.emit("metrics_collected", metrics)
 
     def _get_content(self, ptr: _ContentPtr) -> RealtimeContent:
         response = self._pending_responses[ptr["response_id"]]
@@ -1162,10 +1597,30 @@ class RealtimeSession(utils.EventEmitter[EventTypes]):
         await called_fnc.task
 
         tool_call = llm.ChatMessage.create_tool_from_called_function(called_fnc)
-
+        logger.info(
+            "creating response for tool call",
+            extra={
+                "function": fnc_call_info.function_info.name,
+            },
+        )
         if called_fnc.result is not None:
-            self.conversation.item.create(tool_call, item_id)
-            self.response.create()
+            create_fut = self.conversation.item.create(
+                tool_call,
+                previous_item_id=item_id,
+            )
+            await self.response.create(on_duplicate="keep_both")
+            await create_fut
+
+        # update the message with the tool call result
+        msg = self._remote_conversation_items.get(tool_call.id)
+        if msg is not None:
+            assert msg.tool_call_id == tool_call.tool_call_id
+            assert msg.role == "tool"
+            msg.name = tool_call.name
+            msg.content = tool_call.content
+            msg.tool_exception = tool_call.tool_exception
+
+        self.emit("function_calls_finished", [called_fnc])
 
     def logging_extra(self) -> dict:
         return {"session_id": self._session_id}
