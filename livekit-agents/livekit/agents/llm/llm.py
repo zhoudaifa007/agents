@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable, AsyncIterator
+from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any, Generic, Literal, TypeVar, Union
 
+from opentelemetry import trace
+from opentelemetry.util.types import AttributeValue
 from pydantic import BaseModel, ConfigDict, Field
 
 from livekit import rtc
@@ -15,6 +19,8 @@ from .. import utils
 from .._exceptions import APIConnectionError, APIError
 from ..log import logger
 from ..metrics import LLMMetrics
+from ..telemetry import trace_types, tracer
+from ..telemetry.traces import _chat_ctx_to_otel_events
 from ..types import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
@@ -23,16 +29,22 @@ from ..types import (
 )
 from ..utils import aio
 from .chat_context import ChatContext, ChatRole
-from .tool_context import FunctionTool, ToolChoice
+from .tool_context import FunctionTool, RawFunctionTool, ToolChoice
 
 
 class CompletionUsage(BaseModel):
     completion_tokens: int
+    """The number of tokens in the completion."""
     prompt_tokens: int
+    """The number of input tokens used (includes cached tokens)."""
     prompt_cached_tokens: int = 0
+    """The number of cached input tokens used."""
     cache_creation_tokens: int = 0
+    """The number of tokens used to create the cache."""
     cache_read_tokens: int = 0
+    """The number of tokens read from the cache."""
     total_tokens: int
+    """The total number of tokens used (completion + prompt tokens)."""
 
 
 class FunctionToolCall(BaseModel):
@@ -79,17 +91,33 @@ class LLM(
     def label(self) -> str:
         return self._label
 
+    @property
+    def model(self) -> str:
+        """Get the model name/identifier for this LLM instance.
+
+        Returns:
+            The model name if available, "unknown" otherwise.
+
+        Note:
+            Plugins should override this property to provide their model information.
+        """
+        return "unknown"
+
     @abstractmethod
     def chat(
         self,
         *,
         chat_ctx: ChatContext,
-        tools: list[FunctionTool] | None = None,
+        tools: list[FunctionTool | RawFunctionTool] | None = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
         extra_kwargs: NotGivenOr[dict[str, Any]] = NOT_GIVEN,
     ) -> LLMStream: ...
+
+    def prewarm(self) -> None:
+        """Pre-warm connection to the LLM service"""
+        pass
 
     async def aclose(self) -> None: ...
 
@@ -111,7 +139,7 @@ class LLMStream(ABC):
         llm: LLM,
         *,
         chat_ctx: ChatContext,
-        tools: list[FunctionTool],
+        tools: list[FunctionTool | RawFunctionTool],
         conn_options: APIConnectOptions,
     ) -> None:
         self._llm = llm
@@ -129,14 +157,24 @@ class LLMStream(ABC):
         self._task = asyncio.create_task(self._main_task())
         self._task.add_done_callback(lambda _: self._event_ch.close())
 
+        self._llm_request_span: trace.Span | None = None
+
     @abstractmethod
     async def _run(self) -> None: ...
 
+    @tracer.start_as_current_span("llm_request", end_on_exit=False)
     async def _main_task(self) -> None:
+        self._llm_request_span = trace.get_current_span()
+        self._llm_request_span.set_attribute(trace_types.ATTR_GEN_AI_REQUEST_MODEL, self._llm.model)
+        for name, attributes in _chat_ctx_to_otel_events(self._chat_ctx):
+            self._llm_request_span.add_event(name, attributes)
+
         for i in range(self._conn_options.max_retry + 1):
             try:
                 return await self._run()
             except APIError as e:
+                retry_interval = self._conn_options._interval_for_retry(i)
+
                 if self._conn_options.max_retry == 0 or not e.retryable:
                     self._emit_error(e, recoverable=False)
                     raise
@@ -149,7 +187,7 @@ class LLMStream(ABC):
                 else:
                     self._emit_error(e, recoverable=True)
                     logger.warning(
-                        f"failed to generate LLM completion, retrying in {self._conn_options.retry_interval}s",  # noqa: E501
+                        f"failed to generate LLM completion, retrying in {retry_interval}s",  # noqa: E501
                         exc_info=e,
                         extra={
                             "llm": self._llm._label,
@@ -157,16 +195,23 @@ class LLMStream(ABC):
                         },
                     )
 
-                await asyncio.sleep(self._conn_options.retry_interval)
-                # Reset the flag when retrying
+                if retry_interval > 0:
+                    await asyncio.sleep(retry_interval)
+
+                # reset the flag when retrying
                 self._current_attempt_has_error = False
 
             except Exception as e:
                 self._emit_error(e, recoverable=False)
                 raise
 
-    def _emit_error(self, api_error: Exception, recoverable: bool):
+    def _emit_error(self, api_error: Exception, recoverable: bool) -> None:
         self._current_attempt_has_error = True
+        if not recoverable and self._llm_request_span:
+            self._llm_request_span.record_exception(api_error)
+            self._llm_request_span.set_status(
+                trace.Status(trace.StatusCode.ERROR, description=str(api_error))
+            )
         self._llm.emit(
             "error",
             LLMError(
@@ -184,10 +229,21 @@ class LLMStream(ABC):
         request_id = ""
         usage: CompletionUsage | None = None
 
+        response_content = ""
+        tool_calls: list[FunctionToolCall] = []
+        completion_start_time: str | None = None
+
         async for ev in event_aiter:
             request_id = ev.id
             if ttft == -1.0:
                 ttft = time.perf_counter() - start_time
+                completion_start_time = datetime.now(timezone.utc).isoformat()
+
+            if ev.delta:
+                if ev.delta.content:
+                    response_content += ev.delta.content
+                if ev.delta.tool_calls:
+                    tool_calls.extend(ev.delta.tool_calls)
 
             if ev.usage is not None:
                 usage = ev.usage
@@ -210,6 +266,40 @@ class LLMStream(ABC):
             total_tokens=usage.total_tokens if usage else 0,
             tokens_per_second=usage.completion_tokens / duration if usage else 0.0,
         )
+        if self._llm_request_span:
+            # livekit metrics attribute
+            self._llm_request_span.set_attribute(
+                trace_types.ATTR_LLM_METRICS, metrics.model_dump_json()
+            )
+
+            # set gen_ai attributes
+            self._llm_request_span.set_attributes(
+                {
+                    trace_types.ATTR_GEN_AI_USAGE_INPUT_TOKENS: metrics.prompt_tokens,
+                    trace_types.ATTR_GEN_AI_USAGE_OUTPUT_TOKENS: metrics.completion_tokens,
+                },
+            )
+            if completion_start_time:
+                self._llm_request_span.set_attribute(
+                    trace_types.ATTR_LANGFUSE_COMPLETION_START_TIME, f'"{completion_start_time}"'
+                )
+
+            completion_event_body: dict[str, AttributeValue] = {"role": "assistant"}
+            if response_content:
+                completion_event_body["content"] = response_content
+            if tool_calls:
+                completion_event_body["tool_calls"] = [
+                    json.dumps(
+                        {
+                            "function": {"name": tool_call.name, "arguments": tool_call.arguments},
+                            "id": tool_call.call_id,
+                            "type": "function",
+                        }
+                    )
+                    for tool_call in tool_calls
+                ]
+            self._llm_request_span.add_event(trace_types.EVENT_GEN_AI_CHOICE, completion_event_body)
+
         self._llm.emit("metrics_collected", metrics)
 
     @property
@@ -217,12 +307,15 @@ class LLMStream(ABC):
         return self._chat_ctx
 
     @property
-    def tools(self) -> list[FunctionTool]:
+    def tools(self) -> list[FunctionTool | RawFunctionTool]:
         return self._tools
 
     async def aclose(self) -> None:
         await aio.cancel_and_wait(self._task)
         await self._metrics_task
+        if self._llm_request_span:
+            self._llm_request_span.end()
+            self._llm_request_span = None
 
     async def __anext__(self) -> ChatChunk:
         try:
@@ -255,7 +348,7 @@ class LLMStream(ABC):
         This assumes the stream will not call any tools.
         """
 
-        async def _iterable():
+        async def _iterable() -> AsyncIterable[str]:
             async with self:
                 async for chunk in self:
                     if chunk.delta and chunk.delta.content:

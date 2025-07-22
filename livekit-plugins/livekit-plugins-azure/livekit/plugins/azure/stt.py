@@ -18,6 +18,7 @@ import os
 import weakref
 from copy import deepcopy
 from dataclasses import dataclass
+from typing import Any, cast
 
 import azure.cognitiveservices.speech as speechsdk  # type: ignore
 from livekit import rtc
@@ -95,13 +96,13 @@ class STT(stt.STT):
             language = [language]
 
         if not is_given(speech_host):
-            speech_host = os.environ.get("AZURE_SPEECH_HOST")
+            speech_host = os.environ.get("AZURE_SPEECH_HOST") or NOT_GIVEN
 
         if not is_given(speech_key):
-            speech_key = os.environ.get("AZURE_SPEECH_KEY")
+            speech_key = os.environ.get("AZURE_SPEECH_KEY") or NOT_GIVEN
 
         if not is_given(speech_region):
-            speech_region = os.environ.get("AZURE_SPEECH_REGION")
+            speech_region = os.environ.get("AZURE_SPEECH_REGION") or NOT_GIVEN
 
         if not (
             is_given(speech_host)
@@ -155,10 +156,11 @@ class STT(stt.STT):
         self._streams.add(stream)
         return stream
 
-    def update_options(self, *, language: NotGivenOr[list[str] | str] = NOT_GIVEN):
+    def update_options(self, *, language: NotGivenOr[list[str] | str] = NOT_GIVEN) -> None:
         if is_given(language):
             if isinstance(language, str):
                 language = [language]
+            language = cast(list[str], language)
             self._config.language = language
             for stream in self._streams:
                 stream.update_options(language=language)
@@ -176,12 +178,14 @@ class SpeechStream(stt.SpeechStream):
         self._loop = asyncio.get_running_loop()
         self._reconnect_event = asyncio.Event()
 
-    def update_options(self, *, language: list[str]):
+    def update_options(self, *, language: list[str]) -> None:
         self._opts.language = language
         self._reconnect_event.set()
 
     async def _run(self) -> None:
         while True:
+            self._session_stopped_event.clear()
+
             self._stream = speechsdk.audio.PushAudioInputStream(
                 stream_format=speechsdk.audio.AudioStreamFormat(
                     samples_per_second=self._opts.sample_rate,
@@ -196,6 +200,7 @@ class SpeechStream(stt.SpeechStream):
             self._recognizer.speech_end_detected.connect(self._on_speech_end)
             self._recognizer.session_started.connect(self._on_session_started)
             self._recognizer.session_stopped.connect(self._on_session_stopped)
+            self._recognizer.canceled.connect(self._on_canceled)
             self._recognizer.start_continuous_recognition()
 
             try:
@@ -203,7 +208,7 @@ class SpeechStream(stt.SpeechStream):
                     self._session_started_event.wait(), self._conn_options.timeout
                 )
 
-                async def process_input():
+                async def process_input() -> None:
                     async for input in self._input_ch:
                         if isinstance(input, rtc.AudioFrame):
                             self._stream.write(input.data.tobytes())
@@ -234,13 +239,13 @@ class SpeechStream(stt.SpeechStream):
                 await self._session_stopped_event.wait()
             finally:
 
-                def _cleanup():
+                def _cleanup() -> None:
                     self._recognizer.stop_continuous_recognition()
                     del self._recognizer
 
                 await asyncio.to_thread(_cleanup)
 
-    def _on_recognized(self, evt: speechsdk.SpeechRecognitionEventArgs):
+    def _on_recognized(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
         detected_lg = speechsdk.AutoDetectSourceLanguageResult(evt.result).language
         text = evt.result.text.strip()
         if not text:
@@ -259,7 +264,7 @@ class SpeechStream(stt.SpeechStream):
                 ),
             )
 
-    def _on_recognizing(self, evt: speechsdk.SpeechRecognitionEventArgs):
+    def _on_recognizing(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
         detected_lg = speechsdk.AutoDetectSourceLanguageResult(evt.result).language
         text = evt.result.text.strip()
         if not text:
@@ -279,7 +284,7 @@ class SpeechStream(stt.SpeechStream):
                 ),
             )
 
-    def _on_speech_start(self, evt: speechsdk.SpeechRecognitionEventArgs):
+    def _on_speech_start(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
         if self._speaking:
             return
 
@@ -291,7 +296,7 @@ class SpeechStream(stt.SpeechStream):
                 stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH),
             )
 
-    def _on_speech_end(self, evt: speechsdk.SpeechRecognitionEventArgs):
+    def _on_speech_end(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
         if not self._speaking:
             return
 
@@ -303,15 +308,26 @@ class SpeechStream(stt.SpeechStream):
                 stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH),
             )
 
-    def _on_session_started(self, evt: speechsdk.SpeechRecognitionEventArgs):
+    def _on_session_started(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
         self._session_started_event.set()
 
         with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(self._session_started_event.set)
 
-    def _on_session_stopped(self, evt: speechsdk.SpeechRecognitionEventArgs):
+    def _on_session_stopped(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
         with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(self._session_stopped_event.set)
+
+    def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
+        if evt.cancellation_details.reason == speechsdk.CancellationReason.Error:
+            logger.warning(
+                f"Speech recognition canceled: {evt.cancellation_details}",
+                extra={
+                    "code": evt.cancellation_details.code,
+                    "reason": evt.cancellation_details.reason,
+                    "error_details": evt.cancellation_details.error_details,
+                },
+            )
 
 
 def _create_speech_recognizer(
@@ -344,17 +360,17 @@ def _create_speech_recognizer(
     if is_given(config.profanity):
         speech_config.set_profanity(config.profanity)
 
-    auto_detect_source_language_config = None
-    if config.language and len(config.language) >= 1:
-        auto_detect_source_language_config = (
+    kwargs: dict[str, Any] = {}
+    if config.language and len(config.language) > 1:
+        kwargs["auto_detect_source_language_config"] = (
             speechsdk.languageconfig.AutoDetectSourceLanguageConfig(languages=config.language)
         )
+    elif config.language and len(config.language) == 1:
+        kwargs["language"] = config.language[0]
 
     audio_config = speechsdk.audio.AudioConfig(stream=stream)
     speech_recognizer = speechsdk.SpeechRecognizer(
-        speech_config=speech_config,
-        audio_config=audio_config,
-        auto_detect_source_language_config=auto_detect_source_language_config,  # type: ignore
+        speech_config=speech_config, audio_config=audio_config, **kwargs
     )
 
     return speech_recognizer

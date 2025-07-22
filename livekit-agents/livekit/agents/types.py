@@ -25,6 +25,11 @@ const { state, ... } = useVoiceAssistant();
 TOPIC_CHAT = "lk.chat"
 TOPIC_TRANSCRIPTION = "lk.transcription"
 
+USERDATA_TIMED_TRANSCRIPT = "lk.timed_transcripts"
+"""
+The key for the timed transcripts in the audio frame userdata.
+"""
+
 
 _T = TypeVar("_T")
 
@@ -58,7 +63,7 @@ class APIConnectOptions:
     Timeout for connecting to the API in seconds.
     """
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.max_retry < 0:
             raise ValueError("max_retry must be greater than or equal to 0")
 

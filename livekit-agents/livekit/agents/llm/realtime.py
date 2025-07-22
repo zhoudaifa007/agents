@@ -4,6 +4,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Any, Generic, Literal, TypeVar, Union
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -55,6 +56,7 @@ class RealtimeCapabilities:
     turn_detection: bool
     user_transcription: bool
     auto_tool_reply_generation: bool
+    audio_output: bool
 
 
 class RealtimeError(Exception):
@@ -77,12 +79,24 @@ class RealtimeModel:
     @abstractmethod
     async def aclose(self) -> None: ...
 
+    async def __aenter__(self) -> RealtimeModel:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
 
 EventTypes = Literal[
     "input_speech_started",  # serverside VAD (also used for interruptions)
     "input_speech_stopped",  # serverside VAD
     "input_audio_transcription_completed",
     "generation_created",
+    "session_reconnected",
     "metrics_collected",
     "error",
 ]
@@ -97,6 +111,11 @@ class InputTranscriptionCompleted:
     transcript: str
     """transcript of the input audio"""
     is_final: bool
+
+
+@dataclass
+class RealtimeSessionReconnectedEvent:
+    pass
 
 
 class RealtimeSession(ABC, rtc.EventEmitter[Union[EventTypes, TEvent]], Generic[TEvent]):
@@ -157,7 +176,13 @@ class RealtimeSession(ABC, rtc.EventEmitter[Union[EventTypes, TEvent]], Generic[
 
     # message_id is the ID of the message to truncate (inside the ChatCtx)
     @abstractmethod
-    def truncate(self, *, message_id: str, audio_end_ms: int) -> None: ...
+    def truncate(
+        self, *, message_id: str, audio_end_ms: int, audio_transcript: NotGivenOr[str] = NOT_GIVEN
+    ) -> None: ...
 
     @abstractmethod
     async def aclose(self) -> None: ...
+
+    def start_user_activity(self) -> None:
+        """notifies the model that user activity has started"""
+        pass

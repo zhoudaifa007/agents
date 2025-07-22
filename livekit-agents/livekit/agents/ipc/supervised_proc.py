@@ -16,6 +16,7 @@ from typing import Any
 import psutil
 
 from ..log import logger
+from ..telemetry import metrics
 from ..utils import aio, log_exceptions, time_ms
 from ..utils.aio import duplex_unix
 from . import channel, proto
@@ -127,7 +128,7 @@ class SupervisedProc(ABC):
             self._pid = self._proc.pid
             self._join_fut = asyncio.Future[None]()
 
-            def _sync_run():
+            def _sync_run() -> None:
                 self._proc.join()
                 log_listener.stop()
                 try:
@@ -178,11 +179,13 @@ class SupervisedProc(ABC):
             else:
                 self._initialize_fut.set_result(None)
 
+            elapsed_time = time.perf_counter() - start_time
+            metrics.proc_initialized(time_elapsed=elapsed_time)
             logger.info(
                 "process initialized",
                 extra={
                     **self.logging_extra(),
-                    "elapsed_time": round(time.perf_counter() - start_time, 2),
+                    "elapsed_time": round(elapsed_time, 2),
                 },
             )
         except asyncio.TimeoutError:
@@ -323,7 +326,7 @@ class SupervisedProc(ABC):
     async def _ping_pong_task(self, pong_timeout: aio.Sleep) -> None:
         ping_interval = aio.interval(self._opts.ping_interval)
 
-        async def _send_ping_co():
+        async def _send_ping_co() -> None:
             while True:
                 await ping_interval.tick()
                 try:
@@ -331,7 +334,7 @@ class SupervisedProc(ABC):
                 except duplex_unix.DuplexClosed:
                     break
 
-        async def _pong_timeout_co():
+        async def _pong_timeout_co() -> None:
             await pong_timeout
             logger.error("process is unresponsive, killing process", extra=self.logging_extra())
             self._send_kill_signal()
@@ -402,7 +405,7 @@ class SupervisedProc(ABC):
 
             await asyncio.sleep(5)  # check every 5 seconds
 
-    def logging_extra(self):
+    def logging_extra(self) -> dict[str, Any]:
         extra: dict[str, Any] = {
             "pid": self.pid,
         }

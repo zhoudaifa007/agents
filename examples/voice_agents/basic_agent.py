@@ -71,7 +71,6 @@ async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
-    await ctx.connect()
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -97,9 +96,6 @@ async def entrypoint(ctx: JobContext):
 
     # shutdown callbacks are triggered when the session is over
     ctx.add_shutdown_callback(log_usage)
-
-    # wait for a participant to join the room
-    await ctx.wait_for_participant()
 
     await session.start(
         agent=MyAgent(),
